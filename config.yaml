@@ -23,6 +23,9 @@ capture:
   jpeg_quality: 2           # ffmpeg -q:v, lower = better quality
 
 detection:
+  # In Docker, /app/models is mounted from /mnt/models (the dedicated models
+  # disk), so this resolves to /mnt/models/yolov8n.onnx. For non-Docker runs,
+  # set PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx (env overrides this).
   model_path: "models/yolov8n.onnx"
   input_size: 640
   conf_threshold: 0.35      # min detection confidence (daytime)

@@ -35,7 +35,7 @@ RTSP connections.
 |---|---|
 | `BOT_TOKEN`, `NVR_IP`, `RTSP_USER`, `RTSP_PASS`, `ALLOWED_CHAT_ID` | `.env` (gitignored) |
 | cameras, ROI polygons, tuning | `config.yaml` (committed, non-secret) |
-| `yolov8n.onnx` weights | `models/` (gitignored) |
+| `yolov8n.onnx` weights | `/mnt/models/` (off-repo, dedicated disk) |
 
 ## Setup
 
@@ -45,12 +45,24 @@ cp .env.example .env
 # edit .env with your real BOT_TOKEN, NVR_IP, RTSP creds, ALLOWED_CHAT_ID
 ```
 
-### 2. Model weights (one-time, any machine with internet)
+### 2. Model weights (one-time)
+All AI models live on the dedicated models disk at **`/mnt/models`** (the root
+disk is small). The bot only needs `onnxruntime` at runtime — `ultralytics`/
+`torch` are only used once to produce the ONNX file, so install them into a
+throwaway venv **on the big disk** and remove it afterwards:
+
 ```bash
-pip install ultralytics
-python scripts/export_model.py        # -> models/yolov8n.onnx
+export PIP_CACHE_DIR=/mnt/models/.export-cache TMPDIR=/mnt/models/.export-tmp
+python3 -m venv /mnt/models/.export-venv
+. /mnt/models/.export-venv/bin/activate
+pip install --extra-index-url https://download.pytorch.org/whl/cpu ultralytics
+python scripts/export_model.py            # -> /mnt/models/yolov8n.onnx
+deactivate && rm -rf /mnt/models/.export-venv /mnt/models/.export-cache /mnt/models/.export-tmp
 ```
-`ultralytics`/`torch` are only needed for this export — **not** at runtime.
+
+`docker-compose.yml` mounts `/mnt/models` read-only at `/app/models`, so the
+container finds the weights there. For non-Docker runs, set
+`PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx`.
 
 ### 3. ROI polygons (on the homeserver)
 The two spots in `config.yaml` ship with **placeholder** polygons. Capture a real

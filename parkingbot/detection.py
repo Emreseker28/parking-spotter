@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import Settings, Spot
+from .config import ROOT, Settings, Spot
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +38,14 @@ class Detector:
     def __init__(self, settings: Settings):
         self._s = settings
         det = settings.detection
-        self._model_path = Path(det.get("model_path", "models/yolov8n.onnx"))
+        # Model location: PARKING_MODEL_PATH env wins (handy for non-Docker runs
+        # pointing straight at /mnt/models), else config.yaml's model_path.
+        # Relative paths resolve against the repo root, not the CWD.
+        raw_path = os.environ.get("PARKING_MODEL_PATH") or det.get(
+            "model_path", "models/yolov8n.onnx"
+        )
+        path = Path(raw_path)
+        self._model_path = path if path.is_absolute() else (ROOT / path)
         self._input = int(det.get("input_size", 640))
         self._conf = float(det.get("conf_threshold", 0.35))
         self._nms_iou = float(det.get("nms_iou", 0.45))

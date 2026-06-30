@@ -18,9 +18,20 @@ Lightweight cross-session memory. Append a short entry per phase / decision.
   - Alert policy → **free-only, once per transition**.
   - Camera labels default: 1=Sokak, 2=Giriş, 3=Bahçe (edit in `config.yaml`).
 
-### Still TODO on the homeserver (cannot be done off-box)
+## 2026-06-30 — Models on /mnt/models
+
+- All AI/ML models live on the dedicated **`/mnt/models`** disk (229 GB, ~empty)
+  because the root disk is at 97% (3.8 GB free). This matches the existing
+  `ollama` and `fastembed-cache` dirs already there.
+- `docker-compose.yml` mounts `/mnt/models` → `/app/models` (ro). Non-Docker
+  runs use `PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx`.
+- `yolov8n.onnx` was exported on-box via a throwaway ultralytics/torch venv
+  placed on `/mnt/models` (pip cache + TMPDIR forced there) so the export never
+  touched root, then the venv was deleted. `scripts/export_model.py` writes to
+  `/mnt/models/yolov8n.onnx` by default (`MODEL_OUT` overrides).
+
+### Still TODO on the homeserver
 - [ ] Pin the XVR static IP and set `NVR_IP` in `.env` (plan §9).
 - [ ] Capture real ROI polygons via `scripts/grab_frame.py`, paste into
       `config.yaml` (current polygons are placeholders).
-- [ ] Run `python scripts/export_model.py` to produce `models/yolov8n.onnx`.
 - [ ] Night-frame test (plan §9) → Phase 4 tuning (per-time-of-day thresholds).

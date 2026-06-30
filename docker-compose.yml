@@ -11,8 +11,9 @@ services:
       - .env
 
     volumes:
-      # ONNX weights: kept out of the repo/image; provided at runtime.
-      - ./models:/app/models:ro
+      # ONNX weights live on the dedicated models disk (/mnt/models), NOT in the
+      # repo or image — the root disk is small. Mounted read-only at /app/models.
+      - /mnt/models:/app/models:ro
       # Live-editable config (ROI polygons, cameras, tuning) without rebuilding.
       - ./config.yaml:/app/config.yaml:ro
 
