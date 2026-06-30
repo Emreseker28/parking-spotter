@@ -1,0 +1,30 @@
+services:
+  parking-spotter:
+    build: .
+    image: parking-spotter:latest
+    container_name: parking-spotter
+    restart: unless-stopped
+
+    # Secrets are injected from the gitignored .env file — never baked into the
+    # image and never committed. Copy .env.example -> .env first.
+    env_file:
+      - .env
+
+    volumes:
+      # ONNX weights: kept out of the repo/image; provided at runtime.
+      - ./models:/app/models:ro
+      # Live-editable config (ROI polygons, cameras, tuning) without rebuilding.
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Modest box (i3-4170 / 8GB). Keep the bot from starving the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

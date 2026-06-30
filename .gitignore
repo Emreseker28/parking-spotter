@@ -1,0 +1,29 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+
+# --- Model weights (download/export locally; see README) ---
+models/*.onnx
+models/*.pt
+
+# --- Runtime / scratch ---
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png
+captures/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/

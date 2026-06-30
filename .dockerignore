@@ -1,0 +1,20 @@
+# Keep secrets and weights out of the build context / image.
+.env
+.env.*
+!.env.example
+models/*.onnx
+models/*.pt
+
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+*.jpg
+*.jpeg
+*.png
+docs/
+README.md
+parking-bot-plan.md

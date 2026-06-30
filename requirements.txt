@@ -1,0 +1,9 @@
+# Runtime dependencies only. Model export (ultralytics/torch) is NOT here —
+# it is a one-time host step, see scripts/export_model.py.
+python-telegram-bot[job-queue]==21.6
+onnxruntime==1.19.2
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+PyYAML==6.0.2
+python-dotenv==1.0.1

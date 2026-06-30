@@ -1,0 +1,1 @@
+# Place yolov8n.onnx here (gitignored). Generate with: python scripts/export_model.py

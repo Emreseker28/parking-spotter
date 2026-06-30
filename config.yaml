@@ -1,0 +1,58 @@
+# =====================================================================
+# Parking Spotter — non-secret configuration (safe to commit).
+# Secrets live in .env (gitignored). See .env.example.
+# =====================================================================
+
+# Live channels exposed by /cameras. Keys = RTSP channel number, value = label.
+# Config-driven: add/remove a camera by editing this map (no code change).
+cameras:
+  1: "Sokak"
+  2: "Giriş"
+  3: "Bahçe"
+
+rtsp:
+  port: 554
+  # {channel} and {subtype} are filled in at runtime.
+  path_template: "/cam/realmonitor?channel={channel}&subtype={subtype}"
+  transport: tcp            # tcp is more reliable than udp for the XVR
+  timeout_seconds: 30       # generous: recorder can be slow to first frame
+
+capture:
+  viewer_subtype: 1         # substream (light) for /cameras quick glance
+  detect_subtype: 0         # mainstream (full detail) for /parking + push
+  jpeg_quality: 2           # ffmpeg -q:v, lower = better quality
+
+detection:
+  model_path: "models/yolov8n.onnx"
+  input_size: 640
+  conf_threshold: 0.35      # min detection confidence (daytime)
+  nms_iou: 0.45
+  # COCO vehicle class ids: car=2, motorcycle=3, bus=5, truck=7
+  vehicle_classes: [2, 3, 5, 7]
+  # A spot is OCCUPIED if a vehicle box covers at least this fraction of the ROI.
+  roi_overlap_threshold: 0.15
+
+# The two parking spots. Each ROI polygon is in ITS OWN frame's pixel coords.
+# !! PLACEHOLDER polygons below — replace using scripts/grab_frame.py on the
+#    homeserver (plan §5 / §9). Coordinates are [x, y] pixel pairs.
+spots:
+  - name: "Ön (sarı ev)"     # Spot A
+    channel: 1
+    frame_size: [960, 1080]  # expected mainstream size (informational)
+    # lower-center of the tall frame — adjust to the real slot
+    polygon: [[300, 700], [660, 700], [700, 1020], [260, 1020]]
+
+  - name: "Bahçe"            # Spot B
+    channel: 3
+    frame_size: [960, 576]
+    polygon: [[120, 200], [520, 200], [560, 520], [80, 520]]
+
+push:
+  enabled: true
+  interval_minutes: 4        # poll cadence (plan: start 3-5 min)
+  debounce_frames: 2         # consecutive agreeing frames before flipping state
+  # Decision: notify ONCE when a spot transitions to FREE, then stay quiet.
+  policy: free_only          # free_only | all_changes
+
+inference:
+  omp_num_threads: 2         # cap CPU threads on the i3-4170
