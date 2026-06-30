@@ -28,7 +28,8 @@ detection:
   # set PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx (env overrides this).
   model_path: "models/yolov8n.onnx"
   input_size: 640
-  conf_threshold: 0.30      # min detection confidence (daytime)
+  conf_threshold: 0.25      # min detection confidence; dark cars score low,
+                            # and the ROI-overlap gate rejects off-spot vehicles
   nms_iou: 0.45
   # COCO vehicle class ids: car=2, motorcycle=3, bus=5, truck=7
   vehicle_classes: [2, 3, 5, 7]
