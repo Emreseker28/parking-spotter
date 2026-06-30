@@ -111,7 +111,11 @@ class ParkingBot:
 
     # ------------------------------------------------------------- detection
     async def _check_all_spots(self) -> list[SpotResult]:
-        """Grab each needed channel once (mainstream), evaluate every spot on it."""
+        """Grab each needed channel once (mainstream), evaluate every spot on it.
+
+        Per channel: one full-frame inference (shared by its spots); per spot:
+        one extra ROI-crop inference combined with the full-frame result.
+        """
         import asyncio
 
         subtype = int(self.settings.capture.get("detect_subtype", 0))
@@ -122,13 +126,14 @@ class ParkingBot:
         results: list[SpotResult] = []
         for ch in channels:
             jpeg = await self.capture.grab(ch, subtype)
-            detections, shape = await loop.run_in_executor(
-                None, self.detector.detect, jpeg
-            )
-            for spot in self.settings.spots:
-                if spot.channel != ch:
-                    continue
-                results.append(self.detector.occupancy(spot, detections, shape))
+            ch_spots = [s for s in self.settings.spots if s.channel == ch]
+
+            def _detect_channel(jpeg=jpeg, ch_spots=ch_spots):
+                img = self.detector.decode(jpeg)
+                full_dets = self.detector.detect_array(img)
+                return [self.detector.check_spot(img, s, full_dets) for s in ch_spots]
+
+            results.extend(await loop.run_in_executor(None, _detect_channel))
         # preserve config order
         order = {s.name: i for i, s in enumerate(self.settings.spots)}
         results.sort(key=lambda r: order[r.spot.name])

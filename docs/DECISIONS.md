@@ -30,8 +30,22 @@ Lightweight cross-session memory. Append a short entry per phase / decision.
   touched root, then the venv was deleted. `scripts/export_model.py` writes to
   `/mnt/models/yolov8n.onnx` by default (`MODEL_OUT` overrides).
 
+## 2026-06-30 — Detection tuning against real frames
+
+- Tested live: Spot A (ch1) read DOLU at only 23% (ROI sat too low, catching just
+  the car's rear); Spot B reported BOŞ though occupied.
+- Root cause for Spot B: the large dark top-down car is **invisible to YOLOv8n on
+  the full frame** (best ~0.10). Cropping the ROI out makes it a clear car (~0.75).
+  Conversely Spot A's clear near car **only detects on the full frame**, never on
+  the crop (over-magnification/letterbox distortion).
+- **Fix:** per-spot detection now runs BOTH a full-frame pass (shared per channel)
+  and an ROI-crop pass, taking the best coverage (`crop_detect`/`crop_pad`/
+  `crop_upscale` in config). conf lowered 0.35 → 0.30. Brightening tried, hurt.
+- ROIs re-measured from real frames; both spots now read DOLU (100% / 98%).
+- Renamed Spot B "Bahçe" → **"ev önü"** (per user).
+
 ### Still TODO on the homeserver
 - [ ] Pin the XVR static IP and set `NVR_IP` in `.env` (plan §9).
-- [ ] Capture real ROI polygons via `scripts/grab_frame.py`, paste into
-      `config.yaml` (current polygons are placeholders).
+- [x] Capture real ROI polygons (done 2026-06-30; re-measure if cameras move).
+- [ ] Verify an EMPTY frame reads BOŞ for both spots (no false positives).
 - [ ] Night-frame test (plan §9) → Phase 4 tuning (per-time-of-day thresholds).

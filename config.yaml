@@ -28,27 +28,30 @@ detection:
   # set PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx (env overrides this).
   model_path: "models/yolov8n.onnx"
   input_size: 640
-  conf_threshold: 0.35      # min detection confidence (daytime)
+  conf_threshold: 0.30      # min detection confidence (daytime)
   nms_iou: 0.45
   # COCO vehicle class ids: car=2, motorcycle=3, bus=5, truck=7
   vehicle_classes: [2, 3, 5, 7]
   # A spot is OCCUPIED if a vehicle box covers at least this fraction of the ROI.
   roi_overlap_threshold: 0.15
+  # Per-spot ROI crop pass (plan §6). Some spots only detect on the full frame,
+  # others only on the cropped ROI — we run both and take the best coverage.
+  crop_detect: true
+  crop_pad: 0.15            # expand the ROI bbox by this fraction before cropping
+  crop_upscale: 2.0         # upscale the crop to make mid/far/dark cars bigger
 
 # The two parking spots. Each ROI polygon is in ITS OWN frame's pixel coords.
-# !! PLACEHOLDER polygons below — replace using scripts/grab_frame.py on the
-#    homeserver (plan §5 / §9). Coordinates are [x, y] pixel pairs.
+# Tuned against real frames (2026-06-30). Coordinates are [x, y] pixel pairs.
 spots:
-  - name: "Ön (sarı ev)"     # Spot A
+  - name: "Ön (sarı ev)"     # Spot A — ch1, near SUV against the curb
     channel: 1
     frame_size: [960, 1080]  # expected mainstream size (informational)
-    # lower-center of the tall frame — adjust to the real slot
-    polygon: [[300, 700], [660, 700], [700, 1020], [260, 1020]]
+    polygon: [[285, 425], [510, 435], [505, 815], [295, 805]]
 
-  - name: "Bahçe"            # Spot B
+  - name: "ev önü"          # Spot B — ch3, large dark car (top-down)
     channel: 3
     frame_size: [960, 576]
-    polygon: [[120, 200], [520, 200], [560, 520], [80, 520]]
+    polygon: [[20, 150], [540, 175], [545, 375], [30, 360]]
 
 push:
   enabled: true

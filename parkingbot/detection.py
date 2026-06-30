@@ -47,10 +47,17 @@ class Detector:
         path = Path(raw_path)
         self._model_path = path if path.is_absolute() else (ROOT / path)
         self._input = int(det.get("input_size", 640))
-        self._conf = float(det.get("conf_threshold", 0.35))
+        self._conf = float(det.get("conf_threshold", 0.30))
         self._nms_iou = float(det.get("nms_iou", 0.45))
         self._vehicle = set(det.get("vehicle_classes", [2, 3, 5, 7]))
         self._overlap_thr = float(det.get("roi_overlap_threshold", 0.15))
+        # Per-spot ROI crop pass: some spots (extreme top-down / dark cars) are
+        # invisible to the model on the full frame but clear once the ROI is
+        # cropped out; others (clear near cars) only detect on the full frame.
+        # We run BOTH and take the best coverage (plan §6 crop-and-upscale).
+        self._crop_detect_enabled = bool(det.get("crop_detect", True))
+        self._crop_pad = float(det.get("crop_pad", 0.15))
+        self._crop_upscale = float(det.get("crop_upscale", 2.0))
 
         threads = int(settings.inference.get("omp_num_threads", 2))
         os.environ.setdefault("OMP_NUM_THREADS", str(threads))
@@ -136,19 +143,55 @@ class Detector:
             for i in idxs
         ]
 
-    def detect(self, jpeg_bytes: bytes) -> tuple[list[Detection], tuple[int, int]]:
-        """Return (vehicle detections, (height, width)) for a JPEG frame."""
-        self._ensure_session()
+    @staticmethod
+    def decode(jpeg_bytes: bytes) -> np.ndarray:
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("Could not decode JPEG frame for detection.")
-        h, w = img.shape[:2]
+        return img
+
+    def detect_array(self, img: np.ndarray) -> list[Detection]:
+        """Run detection on a decoded BGR image; boxes in that image's coords."""
+        self._ensure_session()
         tensor, scale, pad_x, pad_y = self._preprocess(img)
         output = self._session.run(None, {self._input_name: tensor})[0]
-        return self._postprocess(output, scale, pad_x, pad_y), (h, w)
+        return self._postprocess(output, scale, pad_x, pad_y)
+
+    def detect(self, jpeg_bytes: bytes) -> tuple[list[Detection], tuple[int, int]]:
+        """Return (vehicle detections, (height, width)) for a JPEG frame."""
+        img = self.decode(jpeg_bytes)
+        h, w = img.shape[:2]
+        return self.detect_array(img), (h, w)
 
     # ----------------------------------------------------------- ROI logic
+    def _roi_bbox(self, spot: Spot, shape: tuple[int, int], pad: float):
+        h, w = shape
+        xs = [p[0] for p in spot.polygon]
+        ys = [p[1] for p in spot.polygon]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        pw, ph = int((x1 - x0) * pad), int((y1 - y0) * pad)
+        return (max(0, x0 - pw), max(0, y0 - ph),
+                min(w, x1 + pw), min(h, y1 + ph))
+
+    def _crop_detect(self, img: np.ndarray, spot: Spot) -> list[Detection]:
+        """Detect on the upscaled ROI crop; map boxes back to full-frame coords."""
+        h, w = img.shape[:2]
+        x0, y0, x1, y1 = self._roi_bbox(spot, (h, w), self._crop_pad)
+        if x1 <= x0 or y1 <= y0:
+            return []
+        crop = img[y0:y1, x0:x1]
+        up = self._crop_upscale
+        if up != 1.0:
+            crop = cv2.resize(crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+        mapped = []
+        for d in self.detect_array(crop):
+            bx1, by1, bx2, by2 = d.box
+            mapped.append(Detection(
+                box=(bx1 / up + x0, by1 / up + y0, bx2 / up + x0, by2 / up + y0),
+                score=d.score, cls=d.cls,
+            ))
+        return mapped
     def _roi_mask(self, spot: Spot, shape: tuple[int, int]):
         h, w = shape
         key = (h, w, spot.name)
@@ -164,11 +207,10 @@ class Detector:
         self._roi_cache[key] = (mask, area)
         return mask, area
 
-    def occupancy(self, spot: Spot, detections: list[Detection],
-                  shape: tuple[int, int]) -> SpotResult:
-        mask, area = self._roi_mask(spot, shape)
+    def _coverage(self, mask: np.ndarray, area: int,
+                  detections: list[Detection], shape: tuple[int, int]) -> float:
         h, w = shape
-        best_cov = 0.0
+        best = 0.0
         if area > 0:
             for det in detections:
                 x1, y1, x2, y2 = det.box
@@ -177,8 +219,21 @@ class Detector:
                 if ix2 <= ix1 or iy2 <= iy1:
                     continue
                 inside = int(mask[iy1:iy2, ix1:ix2].sum())
-                cov = inside / area
-                best_cov = max(best_cov, cov)
-        occupied = best_cov >= self._overlap_thr
-        return SpotResult(spot=spot, occupied=occupied, coverage=best_cov,
-                          detections=detections)
+                best = max(best, inside / area)
+        return best
+
+    def check_spot(self, img: np.ndarray, spot: Spot,
+                   full_dets: list[Detection]) -> SpotResult:
+        """Occupancy for one spot, combining full-frame and ROI-crop detections.
+
+        `full_dets` is the full-frame detection list for the channel (computed
+        once per channel and shared across its spots).
+        """
+        shape = img.shape[:2]
+        mask, area = self._roi_mask(spot, shape)
+        dets = list(full_dets)
+        if self._crop_detect_enabled:
+            dets += self._crop_detect(img, spot)
+        cov = self._coverage(mask, area, dets, shape)
+        return SpotResult(spot=spot, occupied=cov >= self._overlap_thr,
+                          coverage=cov, detections=dets)
