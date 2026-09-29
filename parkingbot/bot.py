@@ -538,8 +538,30 @@ class ParkingBot:
             log.warning("could not write accuracy log %s: %s", self._audit_log, exc)
 
 
+# Commands registered with Telegram (BotFather setMyCommands) at startup so the
+# command list appears in the chat UI.
+BOT_COMMANDS = [
+    ("start", "Hoş geldin"),
+    ("help", "Yardım"),
+    ("cameras", "Kamerayı gör"),
+    ("parking", "Park yerlerini kontrol et"),
+    ("accuracy", "Bot doğruluk raporu"),
+]
+
+
+async def _register_commands(app: Application) -> None:
+    from telegram import BotCommand
+
+    await app.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS])
+
+
 def build_application(settings: Settings) -> Application:
-    app = Application.builder().token(settings.secrets.bot_token).build()
+    app = (
+        Application.builder()
+        .token(settings.secrets.bot_token)
+        .post_init(_register_commands)
+        .build()
+    )
     bot = ParkingBot(settings)
 
     app.add_handler(CommandHandler("start", bot.cmd_start))
