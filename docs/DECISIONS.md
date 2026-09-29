@@ -128,3 +128,34 @@ Phase 7 (fine-tune dataset).
 Root SSD usage from the bot's data: ~0 (all writes via the /mnt/storage mount).
 
 **Decision: keep.** Tests: `python -m unittest discover -s tests` → 20/20.
+
+## 2026-09-29 — Improvement plan Phase 1: feedback + labeled crops
+
+**Changes (behind `feedback.enabled`, now true):**
+1. ✅ Doğru / ❌ Yanlış inline buttons on every /parking result and every alert.
+   Callback data `fb:<spot_idx>:<bot_verdict>:<frame_id>:<response>` (≤26 chars,
+   well under the 64-byte limit). A `frame_id -> coverage/context` index feeds the
+   feedback record.
+2. Padded ROI crops (JPEG q85, ROI only) saved to `data/frames/<ts>_<spot>_<verdict>.jpg`
+   for every state-flip candidate, every alert, and every /parking result (the last is
+   a superset of the plan's list — the ❌ button on a /parking result needs a frame to
+   attach, and the frame only exists during the call). Retention cap
+   `feedback.max_frames` (2000), oldest deleted. Crops land on /mnt/storage via the
+   Phase 0 mount.
+3. `data/feedback.jsonl`: ts, spot, bot verdict, coverage, label, frame id, local hour,
+   context (alert/parking/flip). Written through the rotating append_jsonl.
+4. `/accuracy [days]` now reports from feedback.jsonl: BOŞ-alert precision (correct
+   "BOŞ" / all "BOŞ" alerts), wrong count, per-spot breakdown, day/night split
+   (night = 19:00-06:00 local). VLM-agreement lines only when `verify.enabled`.
+
+**Verification:** 40/40 unit tests (crop naming/geometry, retention, callback
+parsing, accuracy report with hand-computed values, callback handler with mocked
+Telegram update). Live: container runs the new code, feedback enabled, /accuracy
+returns the no-data line until the first press. The button-press path is covered by
+the mocked-update test; the first real press in Telegram will confirm in production.
+
+**Acceptance:** buttons + recording + crops + /accuracy all verified by tests and
+smoke runs. The 1-week feedback collection for judging later phases has started
+(first live data: the 19:48+ push polls and any /parking/alert presses).
+
+**Decision: keep.**
