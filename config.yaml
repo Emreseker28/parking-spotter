@@ -99,3 +99,12 @@ verify:
 
 inference:
   omp_num_threads: 2         # cap CPU threads on the i3-4170
+
+# Human feedback (Phase 1): ✅/❌ buttons on alerts + /parking results, labeled
+# ROI crops for the Phase 7 fine-tune dataset, and a feedback-based /accuracy
+# report. Default off until Phase 1 is accepted.
+feedback:
+  enabled: true               # Phase 1 accepted 2026-09-29 (see DECISIONS.md)
+  max_frames: 2000           # retention cap on data/frames/*.jpg (oldest deleted)
+  frames_dir: "data/frames"
+  jpeg_quality: 85

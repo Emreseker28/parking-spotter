@@ -24,6 +24,14 @@ from telegram.ext import (
 from .capture import CaptureError, CaptureWorker
 from .config import ROOT, Settings, Spot
 from .detection import Detector, SpotResult
+from .feedback import (
+    CB_PREFIX,
+    append_feedback,
+    build_accuracy_report,
+    parse_feedback_callback,
+    prune_frames,
+    save_spot_crop,
+)
 from .jsonl import append_jsonl
 from .push_state import load_push_state, save_push_state
 from .verifier import VerifyResult, Verifier
@@ -66,6 +74,22 @@ class ParkingBot:
         self._push_state_path = sp if sp.is_absolute() else (ROOT / sp)
         self._push_state_max_age = float(settings.push.get("state_max_age_hours", 24)) * 3600
         self._push_state: dict[str, dict] = self._restore_push_state()
+
+        # Human feedback (Phase 1). Relative paths resolve against the repo root
+        # (/app/data in Docker -> the /mnt/storage mount).
+        fcfg = settings.feedback
+        self._feedback_enabled = bool(fcfg.get("enabled", False))
+        raw_fb = str(fcfg.get("log_path", "data/feedback.jsonl"))
+        pfb = Path(raw_fb)
+        self._feedback_log = pfb if pfb.is_absolute() else (ROOT / pfb)
+        raw_frames = str(fcfg.get("frames_dir", "data/frames"))
+        pf = Path(raw_frames)
+        self._frames_dir = pf if pf.is_absolute() else (ROOT / pf)
+        self._feedback_max_frames = int(fcfg.get("max_frames", 2000))
+        self._feedback_quality = int(fcfg.get("jpeg_quality", 85))
+        self._crop_pad = float(settings.detection.get("crop_pad", 0.15))
+        # "frame_id:spot_idx" -> {coverage, context, occupied} for callback lookups
+        self._frame_index: dict[str, dict] = {}
         # Accuracy log (bot-vs-VLM). Relative paths resolve against the repo root;
         # never /mnt/models (read-only in Docker).
         raw_log = str(settings.verify.get("log_path", "data/parking-accuracy.jsonl"))
@@ -78,6 +102,71 @@ class ParkingBot:
             return {}
         log.info("restored push state from %s", self._push_state_path)
         return state
+
+    # ------------------------------------------------------------- feedback
+    def _save_feedback_crop(self, r: SpotResult, spot_idx: int, ts: float,
+                            context: str) -> str | None:
+        """Save the judged ROI crop (Phase 1). Returns the frame id, else None."""
+        if not self._feedback_enabled or r.frame is None:
+            return None
+        fid = save_spot_crop(r.frame, r.spot, spot_idx, r.occupied, ts,
+                            self._frames_dir, self._crop_pad, self._feedback_quality)
+        if fid is not None:
+            prune_frames(self._frames_dir, self._feedback_max_frames)
+        return fid
+
+    def _feedback_buttons(self, entries: list[tuple[SpotResult, int]],
+                          context: str) -> InlineKeyboardMarkup | None:
+        """One row per spot: [✅ Doğru] [❌ Yanlış]. Saves the crop, registers
+        the frame index, and returns the keyboard (None when feedback is off or
+        no crop could be saved)."""
+        rows = []
+        now = time.time()
+        for r, spot_idx in entries:
+            fid = self._save_feedback_crop(r, spot_idx, now, context)
+            if fid is None:
+                continue
+            verdict = "occupied" if r.occupied else "free"
+            self._frame_index[f"{fid}:{spot_idx}"] = {
+                "coverage": round(r.coverage, 4), "context": context,
+                "occupied": r.occupied,
+            }
+            rows.append([
+                InlineKeyboardButton("✅ Doğru",
+                                     callback_data=f"fb:{spot_idx}:{verdict}:{fid}:ok"),
+                InlineKeyboardButton("❌ Yanlış",
+                                     callback_data=f"fb:{spot_idx}:{verdict}:{fid}:no"),
+            ])
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    @restricted
+    async def on_feedback_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self._feedback_enabled:
+            await query.answer()
+            return
+        parsed = parse_feedback_callback(query.data or "")
+        if parsed is None:
+            await query.answer()
+            return
+        spot_idx, bot_verdict, fid, response = parsed
+        if not 0 <= spot_idx < len(self.settings.spots):
+            await query.answer()
+            return
+        spot = self.settings.spots[spot_idx]
+        info = self._frame_index.get(f"{fid}:{spot_idx}", {})
+        label = "correct" if response == "ok" else "wrong"
+        append_feedback(self._feedback_log, {
+            "ts": time.time(), "type": "feedback",
+            "spot": spot.name, "spot_idx": spot_idx,
+            "bot_occupied": bot_verdict == "occupied",
+            "coverage": info.get("coverage", 0.0),
+            "label": label, "frame_id": fid,
+            "hour": time.localtime().tm_hour,
+            "context": info.get("context", "unknown"),
+        })
+        log.info("feedback: %r %s (bot=%s, frame=%s)", spot.name, label, bot_verdict, fid)
+        await query.answer("Kaydedildi ✅" if response == "ok" else "Kaydedildi ❌")
 
     # ------------------------------------------------------------ commands
     @restricted
@@ -133,7 +222,13 @@ class ParkingBot:
             log.exception("parking check failed")
             await msg.edit_text(f"⚠️ Check failed: {exc}")
             return
-        await msg.edit_text(self._format_results(results), parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(
+            self._format_results(results),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=self._feedback_buttons(
+                [(r, i) for i, r in enumerate(results)], "parking"
+            ),
+        )
 
     @restricted
     async def cmd_accuracy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,13 +244,29 @@ class ParkingBot:
         )
 
     def _format_accuracy(self, days: int) -> str:
-        if not self._audit_log.exists():
-            return "📊 *Doğruluk*\nHenüz kayıt yok (VLM audit log boş)."
-        cutoff = time.time() - days * 86400
-        per_spot: dict[str, list[int]] = {}   # name -> [agree, total]
-        checks = 0
-        suppressed = 0
-        for line in self._audit_log.read_text(encoding="utf-8").splitlines():
+        """Feedback-based report (Phase 1) + VLM-agreement lines (only when verify
+        is enabled). Returns a 'no data' line when neither has records."""
+        parts = []
+        if self._feedback_enabled and self._feedback_log.exists():
+            report = build_accuracy_report(days, self._read_jsonl(self._feedback_log))
+            if report:
+                parts.append(report)
+        if self.verifier.enabled and self._audit_log.exists():
+            vlm = self._format_vlm_accuracy(days)
+            if vlm:
+                parts.append(vlm)
+        if not parts:
+            return "📊 *Doğruluk*\nHenüz kayıt yok."
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict]:
+        records = []
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return records
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
@@ -163,6 +274,17 @@ class ParkingBot:
                 rec = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(rec, dict):
+                records.append(rec)
+        return records
+
+    def _format_vlm_accuracy(self, days: int) -> str:
+        """Bot-vs-VLM agreement (only meaningful while the VLM gate is enabled)."""
+        cutoff = time.time() - days * 86400
+        per_spot: dict[str, list[int]] = {}   # name -> [agree, total]
+        checks = 0
+        suppressed = 0
+        for rec in self._read_jsonl(self._audit_log):
             if float(rec.get("ts", 0)) < cutoff:
                 continue
             if rec.get("type") == "suppressed":
@@ -176,7 +298,7 @@ class ParkingBot:
             tally[1] += 1
 
         if checks == 0:
-            return f"📊 *Doğruluk* (son {days} gün)\nBu pencerede doğrulanmış kayıt yok."
+            return ""
         agree_total = sum(a for a, _ in per_spot.values())
         lines = [f"📊 *Doğruluk* (son {days} gün)"]
         lines.append(f"• Genel uyum: *{agree_total / checks:.0%}*  ({agree_total}/{checks})")
@@ -241,7 +363,7 @@ class ParkingBot:
             log.warning("push poll failed: %s", exc)
             return
 
-        for r in results:
+        for spot_idx, r in enumerate(results):
             now = "occupied" if r.occupied else "free"
             st = self._push_state.setdefault(
                 r.spot.name, {"confirmed": None, "candidate": None, "count": 0}
@@ -253,6 +375,11 @@ class ParkingBot:
             else:
                 st["candidate"] = now
                 st["count"] = 1
+
+            # Phase 1: save a crop for every state-flip candidate (dataset for the
+            # Phase 2 offline replay and the Phase 7 fine-tune).
+            if st["confirmed"] is not None and now != st["confirmed"]:
+                self._save_feedback_crop(r, spot_idx, time.time(), "flip")
 
             # AUDIT: every poll, ask the VLM and log agreement (credibility score).
             verdict: VerifyResult | None = None
@@ -324,6 +451,7 @@ class ParkingBot:
                 chat_id=chat_id,
                 text=f"{prefix}{emoji} *{r.spot.name}* şimdi *{state}*",
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=self._feedback_buttons([(r, spot_idx)], "alert"),
             )
 
         # Persist debounce/transition state so a restart mid-cycle survives.
@@ -358,6 +486,7 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("parking", bot.cmd_parking))
     app.add_handler(CommandHandler("accuracy", bot.cmd_accuracy))
     app.add_handler(CallbackQueryHandler(bot.on_camera_button, pattern=f"^{CAM_CB_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(bot.on_feedback_button, pattern=f"^{CB_PREFIX[:-1]}"))
 
     if settings.push.get("enabled", False):
         interval = float(settings.push.get("interval_minutes", 4)) * 60

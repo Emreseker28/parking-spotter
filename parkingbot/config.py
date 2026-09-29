@@ -67,6 +67,10 @@ class Settings:
         return self.raw.get("verify", {})
 
     @property
+    def feedback(self) -> dict:
+        return self.raw.get("feedback", {})
+
+    @property
     def inference(self) -> dict:
         return self.raw.get("inference", {})
 
