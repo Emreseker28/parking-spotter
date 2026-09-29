@@ -159,3 +159,35 @@ smoke runs. The 1-week feedback collection for judging later phases has started
 (first live data: the 19:48+ push polls and any /parking/alert presses).
 
 **Decision: keep.**
+
+## 2026-09-29 — Improvement plan Phase 2: stability ("no motion") gate
+
+**Mechanism:** per spot, keep the last confirmed-occupied ROI crop (grayscale, 160px
+wide, CLAHE-normalized, Canny edges, polygon-interior mask). When YOLO says FREE but
+the spot is confirmed OCCUPIED and the current crop matches the reference (edge-NCC
+>= threshold), override to OCCUPIED and log `stable_override`. Reference refreshes
+whenever YOLO reports OCCUPIED with coverage >= 0.5; references older than 12h are
+ignored. A car that leaves changes the ROI (low sim -> no override); a missed dark
+car leaves it unchanged (high sim -> override). Cost: one crop + one matchTemplate
+per pending FREE verdict — no model inference on the steady path.
+
+**Offline replay (threshold selection, 2026-09-29 night, ev önü):**
+- Occupied pairs (SUV present, frames ~1h apart, night IR): sim **0.64–0.78**.
+- Simulated departures (SUV inpainted out): sim **0.19–0.26**.
+- Chosen threshold: **0.45** (margin on both sides; lower than the plan's 0.85
+  suggestion because IR night pairs score lower).
+- **Caveat:** production compares a daytime reference (refreshed when YOLO detects
+  the car by day) against a night current — the day/night gap is not measured here
+  and pushes occupied sims down. The 0.45 threshold hedges for it; the live week
+  will give the real number. If night misses aren't caught, lower it (or lower
+  min_coverage so marginal night detections refresh the reference to a night crop).
+
+**Verification:** 51/51 unit tests (crop shape, self-similarity = 1.0, departure
+low, noisy-same-car high, rule cases, staleness). Deployed with
+`stability.enabled: true`. The gate only suppresses free alerts (never creates
+ones), so a wrong threshold can only delay a real free alert, not spam.
+
+**Acceptance:** offline replay done (threshold + numbers above). The live week
+(night false-"BOŞ" per ❌ feedback vs baseline) is now running.
+
+**Decision: keep.**
