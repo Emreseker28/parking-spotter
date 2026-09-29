@@ -21,8 +21,10 @@ services:
       - /mnt/models:/app/models:ro
       # Live-editable config (ROI polygons, cameras, tuning) without rebuilding.
       - ./config.yaml:/app/config.yaml:ro
-      # Writable dir for the accuracy log (VLM audit). /mnt/models is read-only.
-      - ./data:/app/data
+      # Writable data dir (accuracy log, feedback, push state, frame crops).
+      # On the dedicated storage volume — NOT the root SSD, NOT the read-only
+      # /mnt/models mount. Phase 0 task 1.
+      - /mnt/storage/parking-spotter/data:/app/data
 
     # Modest box (i3-4170 / 8GB). Keep the bot from starving the host.
     deploy:

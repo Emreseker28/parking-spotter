@@ -6,6 +6,8 @@
 # --- Model weights (download/export locally; see README) ---
 models/*.onnx
 models/*.pt
+/*.onnx
+/*.pt
 
 # --- Runtime / scratch ---
 *.jpg

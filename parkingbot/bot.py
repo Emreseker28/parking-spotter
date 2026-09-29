@@ -24,6 +24,8 @@ from telegram.ext import (
 from .capture import CaptureError, CaptureWorker
 from .config import ROOT, Settings, Spot
 from .detection import Detector, SpotResult
+from .jsonl import append_jsonl
+from .push_state import load_push_state, save_push_state
 from .verifier import VerifyResult, Verifier
 
 log = logging.getLogger(__name__)
@@ -56,13 +58,26 @@ class ParkingBot:
         self.capture = CaptureWorker(settings)
         self.detector = Detector(settings)
         self.verifier = Verifier(settings)
-        # per-spot debounce/transition state for the push loop
-        self._push_state: dict[str, dict] = {}
+        # Per-spot debounce/transition state for the push loop. Persisted after
+        # every poll (atomic write) and restored on startup when fresh, so a
+        # restart mid-cycle keeps the confirmed state (Phase 0 task 3).
+        raw_state = str(settings.push.get("state_path", "data/push_state.json"))
+        sp = Path(raw_state)
+        self._push_state_path = sp if sp.is_absolute() else (ROOT / sp)
+        self._push_state_max_age = float(settings.push.get("state_max_age_hours", 24)) * 3600
+        self._push_state: dict[str, dict] = self._restore_push_state()
         # Accuracy log (bot-vs-VLM). Relative paths resolve against the repo root;
         # never /mnt/models (read-only in Docker).
         raw_log = str(settings.verify.get("log_path", "data/parking-accuracy.jsonl"))
         p = Path(raw_log)
         self._audit_log = p if p.is_absolute() else (ROOT / p)
+
+    def _restore_push_state(self) -> dict[str, dict]:
+        state = load_push_state(self._push_state_path, self._push_state_max_age)
+        if state is None:
+            return {}
+        log.info("restored push state from %s", self._push_state_path)
+        return state
 
     # ------------------------------------------------------------ commands
     @restricted
@@ -311,14 +326,24 @@ class ParkingBot:
                 parse_mode=ParseMode.MARKDOWN,
             )
 
+        # Persist debounce/transition state so a restart mid-cycle survives.
+        try:
+            save_push_state(self._push_state_path, self._push_state)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not save push state: %s", exc)
+
     # ---------------------------------------------------------- accuracy log
     def _append_log(self, record: dict) -> None:
         """Append one JSON line to the accuracy log. Never raises into the loop."""
         record = {"ts": time.time(), **record}
         try:
-            self._audit_log.parent.mkdir(parents=True, exist_ok=True)
-            with self._audit_log.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            vcfg = self.settings.verify
+            append_jsonl(
+                self._audit_log,
+                record,
+                max_bytes=int(vcfg.get("log_max_mb", 10)) * 1024 * 1024,
+                keep=int(vcfg.get("log_keep", 3)),
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("could not write accuracy log %s: %s", self._audit_log, exc)
 

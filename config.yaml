@@ -63,6 +63,13 @@ push:
                              # defense, so drop this to 2 if you want faster alerts.
   # Decision: notify ONCE when a spot transitions to FREE, then stay quiet.
   policy: free_only          # free_only | all_changes
+  # Debounce/transition state is persisted here (atomic write) so a container
+  # restart mid-cycle does not lose the confirmed state or re-baseline.
+  # Relative paths resolve against the repo root (/app/data in Docker).
+  state_path: "data/push_state.json"
+  # On startup, restore the saved state only if it is newer than this many
+  # hours; otherwise the first reading sets a fresh baseline.
+  state_max_age_hours: 24
 
 # Second-opinion visual verification with a LOCAL vision model (ollama).
 # Two jobs: (1) GATE — before sending a "BOŞ/empty" alert, ask the VLM whether the spot
@@ -85,6 +92,10 @@ verify:
   # Writable path for the accuracy log. Relative paths resolve against the repo root.
   # NOT /mnt/models — that disk is mounted read-only in Docker.
   log_path: "data/parking-accuracy.jsonl"
+  # Size-based rotation for the accuracy log (Phase 0 task 2): rotate when the
+  # file would exceed log_max_mb, keep log_keep generations (.1, .2, ...).
+  log_max_mb: 10
+  log_keep: 3
 
 inference:
   omp_num_threads: 2         # cap CPU threads on the i3-4170
