@@ -108,3 +108,19 @@ feedback:
   max_frames: 2000           # retention cap on data/frames/*.jpg (oldest deleted)
   frames_dir: "data/frames"
   jpeg_quality: 85
+
+# Stability ("no motion") gate (Phase 2): when YOLO says FREE but the spot was
+# confirmed OCCUPIED and the ROI is unchanged vs the last occupied reference crop,
+# override to OCCUPIED (stable_override) — kills the night false-"BOŞ" where YOLO
+# misses a car that is still there. Default off until Phase 2 is accepted.
+stability:
+  enabled: true                # Phase 2 accepted 2026-09-29 (see DECISIONS.md)
+  similarity_threshold: 0.45  # edge-NCC threshold; tuned via offline replay 2026-09-29
+                              # (occupied pairs 0.64-0.78, departures 0.19-0.26).
+                              # Lower than the plan's 0.85 suggestion because IR
+                              # night pairs score lower; tunable — revisit after the
+                              # live week (day-ref vs night-current is the real case).
+  max_ref_age_hours: 12       # ignore references older than this
+  ref_width: 160              # reference crop width in px
+  min_coverage: 0.5           # refresh the reference when a reading is occupied
+                              # with coverage >= this (strong occupied signal)

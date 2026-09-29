@@ -34,6 +34,7 @@ from .feedback import (
 )
 from .jsonl import append_jsonl
 from .push_state import load_push_state, save_push_state
+from .stability import StabilityGate
 from .verifier import VerifyResult, Verifier
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class ParkingBot:
         self.capture = CaptureWorker(settings)
         self.detector = Detector(settings)
         self.verifier = Verifier(settings)
+        self.stability = StabilityGate(settings)
         # Per-spot debounce/transition state for the push loop. Persisted after
         # every poll (atomic write) and restored on startup when fresh, so a
         # restart mid-cycle keeps the confirmed state (Phase 0 task 3).
@@ -368,6 +370,13 @@ class ParkingBot:
             st = self._push_state.setdefault(
                 r.spot.name, {"confirmed": None, "candidate": None, "count": 0}
             )
+
+            # Phase 2 stability gate: refresh the reference on strong occupied
+            # readings; override FREE->OCCUPIED when the ROI is unchanged (the
+            # night false-"BOŞ": YOLO misses a car that is still there).
+            if self.stability.check(r, st["confirmed"]):
+                r.occupied = True
+                now = "occupied"
 
             # Debounce: require N consecutive agreeing frames before flipping.
             if now == st["candidate"]:
