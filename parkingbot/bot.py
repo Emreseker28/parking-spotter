@@ -7,7 +7,10 @@ captures funnel through one serialized CaptureWorker.
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import time
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -19,8 +22,9 @@ from telegram.ext import (
 )
 
 from .capture import CaptureError, CaptureWorker
-from .config import Settings, Spot
+from .config import ROOT, Settings, Spot
 from .detection import Detector, SpotResult
+from .verifier import VerifyResult, Verifier
 
 log = logging.getLogger(__name__)
 
@@ -51,8 +55,14 @@ class ParkingBot:
         self.settings = settings
         self.capture = CaptureWorker(settings)
         self.detector = Detector(settings)
+        self.verifier = Verifier(settings)
         # per-spot debounce/transition state for the push loop
         self._push_state: dict[str, dict] = {}
+        # Accuracy log (bot-vs-VLM). Relative paths resolve against the repo root;
+        # never /mnt/models (read-only in Docker).
+        raw_log = str(settings.verify.get("log_path", "data/parking-accuracy.jsonl"))
+        p = Path(raw_log)
+        self._audit_log = p if p.is_absolute() else (ROOT / p)
 
     # ------------------------------------------------------------ commands
     @restricted
@@ -60,7 +70,8 @@ class ParkingBot:
         await update.effective_message.reply_text(
             "🚗 *Parking Spotter*\n\n"
             "/cameras — view a camera\n"
-            "/parking — check the parking spots now",
+            "/parking — check the parking spots now\n"
+            "/accuracy — bot vs. AI credibility score",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -109,6 +120,56 @@ class ParkingBot:
             return
         await msg.edit_text(self._format_results(results), parse_mode=ParseMode.MARKDOWN)
 
+    @restricted
+    async def cmd_accuracy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report how often the bot and the VLM agreed (a credibility score)."""
+        days = 7
+        if context.args:
+            try:
+                days = max(1, int(context.args[0]))
+            except ValueError:
+                pass
+        await update.effective_message.reply_text(
+            self._format_accuracy(days), parse_mode=ParseMode.MARKDOWN
+        )
+
+    def _format_accuracy(self, days: int) -> str:
+        if not self._audit_log.exists():
+            return "📊 *Doğruluk*\nHenüz kayıt yok (VLM audit log boş)."
+        cutoff = time.time() - days * 86400
+        per_spot: dict[str, list[int]] = {}   # name -> [agree, total]
+        checks = 0
+        suppressed = 0
+        for line in self._audit_log.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if float(rec.get("ts", 0)) < cutoff:
+                continue
+            if rec.get("type") == "suppressed":
+                suppressed += 1
+                continue
+            if rec.get("type") != "audit" or rec.get("agree") is None:
+                continue
+            checks += 1
+            tally = per_spot.setdefault(rec.get("spot", "?"), [0, 0])
+            tally[0] += 1 if rec["agree"] else 0
+            tally[1] += 1
+
+        if checks == 0:
+            return f"📊 *Doğruluk* (son {days} gün)\nBu pencerede doğrulanmış kayıt yok."
+        agree_total = sum(a for a, _ in per_spot.values())
+        lines = [f"📊 *Doğruluk* (son {days} gün)"]
+        lines.append(f"• Genel uyum: *{agree_total / checks:.0%}*  ({agree_total}/{checks})")
+        for name, (a, t) in sorted(per_spot.items()):
+            lines.append(f"• {name}: {a / t:.0%}  ({a}/{t})")
+        lines.append(f"• Engellenen yanlış 'BOŞ': *{suppressed}*")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------- detection
     async def _check_all_spots(self) -> list[SpotResult]:
         """Grab each needed channel once (mainstream), evaluate every spot on it.
@@ -150,9 +211,14 @@ class ParkingBot:
     # -------------------------------------------------------------- push loop
     async def push_job(self, context: ContextTypes.DEFAULT_TYPE):
         push = self.settings.push
+        vcfg = self.settings.verify
         debounce = int(push.get("debounce_frames", 2))
         policy = str(push.get("policy", "free_only"))
         chat_id = self.settings.secrets.allowed_chat_id
+        verify_on = self.verifier.enabled
+        do_audit = verify_on and bool(vcfg.get("audit", True))
+        do_gate = verify_on and bool(vcfg.get("gate", True))
+        fail_open = bool(vcfg.get("fail_open", True))
 
         try:
             results = await self._check_all_spots()
@@ -173,6 +239,21 @@ class ParkingBot:
                 st["candidate"] = now
                 st["count"] = 1
 
+            # AUDIT: every poll, ask the VLM and log agreement (credibility score).
+            verdict: VerifyResult | None = None
+            if do_audit:
+                verdict = await self.verifier.verify_spot(r.frame, r.spot)
+                self._append_log({
+                    "type": "audit",
+                    "spot": r.spot.name,
+                    "bot_occupied": r.occupied,
+                    "coverage": round(r.coverage, 4),
+                    "vlm_ok": verdict.ok,
+                    "vlm_occupied": verdict.occupied,
+                    "vlm_confidence": round(verdict.confidence, 3),
+                    "agree": (r.occupied == verdict.occupied) if verdict.ok else None,
+                })
+
             if st["count"] < debounce:
                 continue
             if now == st["confirmed"]:
@@ -187,13 +268,59 @@ class ParkingBot:
             if policy == "free_only" and not transition_to_free:
                 continue
 
+            # GATE: don't cry "BOŞ" unless the VLM agrees the spot is empty. This is
+            # what kills the night false positives (YOLO misses a dark car -> FREE).
+            unverified = False
+            if do_gate and transition_to_free:
+                if verdict is None:
+                    verdict = await self.verifier.verify_spot(r.frame, r.spot)
+                if verdict.ok and verdict.occupied:
+                    log.info(
+                        "gate: suppressed false BOŞ for %r (VLM sees a car, conf %.2f: %s)",
+                        r.spot.name, verdict.confidence, verdict.reason,
+                    )
+                    self._append_log({
+                        "type": "suppressed",
+                        "spot": r.spot.name,
+                        "vlm_confidence": round(verdict.confidence, 3),
+                        "vlm_reason": verdict.reason,
+                    })
+                    st["confirmed"] = prev  # revert so we re-check next poll
+                    continue
+                if not verdict.ok:
+                    if fail_open:
+                        unverified = True
+                        log.warning(
+                            "gate: VLM unavailable for %r, sending UNVERIFIED alert (%s)",
+                            r.spot.name, verdict.reason,
+                        )
+                    else:
+                        log.warning(
+                            "gate: VLM unavailable for %r, fail-closed -> suppress (%s)",
+                            r.spot.name, verdict.reason,
+                        )
+                        st["confirmed"] = prev
+                        continue
+
             emoji = "🟢" if transition_to_free else "🔴"
             state = "BOŞ" if transition_to_free else "DOLU"
+            prefix = "⚠️ _(doğrulanamadı)_ " if unverified else ""
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{emoji} *{r.spot.name}* şimdi *{state}*",
+                text=f"{prefix}{emoji} *{r.spot.name}* şimdi *{state}*",
                 parse_mode=ParseMode.MARKDOWN,
             )
+
+    # ---------------------------------------------------------- accuracy log
+    def _append_log(self, record: dict) -> None:
+        """Append one JSON line to the accuracy log. Never raises into the loop."""
+        record = {"ts": time.time(), **record}
+        try:
+            self._audit_log.parent.mkdir(parents=True, exist_ok=True)
+            with self._audit_log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not write accuracy log %s: %s", self._audit_log, exc)
 
 
 def build_application(settings: Settings) -> Application:
@@ -204,6 +331,7 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("help", bot.cmd_start))
     app.add_handler(CommandHandler("cameras", bot.cmd_cameras))
     app.add_handler(CommandHandler("parking", bot.cmd_parking))
+    app.add_handler(CommandHandler("accuracy", bot.cmd_accuracy))
     app.add_handler(CallbackQueryHandler(bot.on_camera_button, pattern=f"^{CAM_CB_PREFIX}"))
 
     if settings.push.get("enabled", False):

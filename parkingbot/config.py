@@ -63,6 +63,10 @@ class Settings:
         return self.raw.get("push", {})
 
     @property
+    def verify(self) -> dict:
+        return self.raw.get("verify", {})
+
+    @property
     def inference(self) -> dict:
         return self.raw.get("inference", {})
 

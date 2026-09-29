@@ -56,10 +56,35 @@ spots:
 
 push:
   enabled: true
-  interval_minutes: 4        # poll cadence (plan: start 3-5 min)
-  debounce_frames: 2         # consecutive agreeing frames before flipping state
+  interval_minutes: 30       # poll cadence (raised from 4 -> 30 to stop night flicker)
+  debounce_frames: 3         # consecutive agreeing polls before flipping state.
+                             # At 30 min/poll a FREE state must persist ~1-1.5h before
+                             # alerting. The VLM gate below is the primary false-positive
+                             # defense, so drop this to 2 if you want faster alerts.
   # Decision: notify ONCE when a spot transitions to FREE, then stay quiet.
   policy: free_only          # free_only | all_changes
+
+# Second-opinion visual verification with a LOCAL vision model (ollama).
+# Two jobs: (1) GATE — before sending a "BOŞ/empty" alert, ask the VLM whether the spot
+# is really empty; if it sees a car, suppress the alert (kills the night false positives
+# where YOLO misses dark/top-down cars). (2) AUDIT — every poll, log bot-vs-VLM agreement
+# so /accuracy can report how trustworthy the bot is.
+verify:
+  enabled: false      # DISABLED 2026-07-01: local VLM is unviable on this box (i3-4170, 2 cores,
+                      # 7.5GiB RAM, no GPU). moondream swap-thrashed all cores and did not return a
+                      # verdict in 180s warm; sustained draw tripped a power shutdown. To re-enable,
+                      # OFFLOAD ollama to a capable LAN host and set OLLAMA_URL to it (keeps frames on-net).
+  backend: ollama
+  ollama_url: "http://localhost:11434"   # env OLLAMA_URL overrides (Docker: host.docker.internal)
+  model: "moondream"                      # weights MUST live on /mnt/models (see README/DECISIONS); moondream chosen: qwen2.5vl:3b needs ~10GiB (> 7.5GiB total RAM) on this CPU-only box
+  timeout_seconds: 60
+  gate: true          # suppress a FREE alert if the VLM says the spot is occupied
+  audit: true         # log bot-vs-VLM agreement every poll (credibility score)
+  fail_open: true     # if the VLM is unreachable, SEND the alert (tagged) rather than lose a real free
+  crop_pad: 0.15      # expand the ROI bbox by this fraction before cropping (matches detector)
+  # Writable path for the accuracy log. Relative paths resolve against the repo root.
+  # NOT /mnt/models — that disk is mounted read-only in Docker.
+  log_path: "data/parking-accuracy.jsonl"
 
 inference:
   omp_num_threads: 2         # cap CPU threads on the i3-4170

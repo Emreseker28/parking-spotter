@@ -19,6 +19,20 @@ from .config import ROOT, Settings, Spot
 log = logging.getLogger(__name__)
 
 
+def roi_bbox(polygon, shape: tuple[int, int], pad: float) -> tuple[int, int, int, int]:
+    """Padded axis-aligned bbox of an ROI polygon, clamped to the frame.
+
+    Shared by the detector's ROI-crop pass and the VLM verifier so both look at
+    the exact same spot region (returns x0, y0, x1, y1).
+    """
+    h, w = shape
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    pw, ph = int((x1 - x0) * pad), int((y1 - y0) * pad)
+    return (max(0, x0 - pw), max(0, y0 - ph), min(w, x1 + pw), min(h, y1 + ph))
+
+
 @dataclass
 class Detection:
     box: tuple[float, float, float, float]  # x1, y1, x2, y2 in original pixels
@@ -32,6 +46,7 @@ class SpotResult:
     occupied: bool
     coverage: float          # best vehicle coverage of the ROI [0..1]
     detections: list[Detection]
+    frame: np.ndarray | None = None  # source frame, shared with the VLM verifier
 
 
 class Detector:
@@ -166,13 +181,7 @@ class Detector:
 
     # ----------------------------------------------------------- ROI logic
     def _roi_bbox(self, spot: Spot, shape: tuple[int, int], pad: float):
-        h, w = shape
-        xs = [p[0] for p in spot.polygon]
-        ys = [p[1] for p in spot.polygon]
-        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-        pw, ph = int((x1 - x0) * pad), int((y1 - y0) * pad)
-        return (max(0, x0 - pw), max(0, y0 - ph),
-                min(w, x1 + pw), min(h, y1 + ph))
+        return roi_bbox(spot.polygon, shape, pad)
 
     def _crop_detect(self, img: np.ndarray, spot: Spot) -> list[Detection]:
         """Detect on the upscaled ROI crop; map boxes back to full-frame coords."""
@@ -236,4 +245,4 @@ class Detector:
             dets += self._crop_detect(img, spot)
         cov = self._coverage(mask, area, dets, shape)
         return SpotResult(spot=spot, occupied=cov >= self._overlap_thr,
-                          coverage=cov, detections=dets)
+                          coverage=cov, detections=dets, frame=img)

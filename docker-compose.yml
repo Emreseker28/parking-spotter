@@ -10,12 +10,19 @@ services:
     env_file:
       - .env
 
+    # ollama runs on the HOST; reach it from the container via host.docker.internal.
+    # OLLAMA_URL in .env should point at http://host.docker.internal:11434.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     volumes:
       # ONNX weights live on the dedicated models disk (/mnt/models), NOT in the
       # repo or image — the root disk is small. Mounted read-only at /app/models.
       - /mnt/models:/app/models:ro
       # Live-editable config (ROI polygons, cameras, tuning) without rebuilding.
       - ./config.yaml:/app/config.yaml:ro
+      # Writable dir for the accuracy log (VLM audit). /mnt/models is read-only.
+      - ./data:/app/data
 
     # Modest box (i3-4170 / 8GB). Keep the bot from starving the host.
     deploy:

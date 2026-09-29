@@ -5,9 +5,12 @@ A Telegram bot that watches two parking spots through a Dahua XVR recorder and:
 - **`/cameras`** — inline keyboard of live cameras; tap one (or *All*) to get a fresh snapshot.
 - **`/parking`** — on-demand occupancy check of both spots (free / occupied).
 - **Push alerts** — polls periodically and pings you when a spot becomes **free**.
+- **`/accuracy`** — a credibility score: how often YOLO and the AI second opinion agree.
 
 Built around single-frame ffmpeg snapshots (the stream is HEVC/H.265), with
-YOLOv8n (ONNX, CPU) for vehicle detection. Designed for a modest homeserver.
+YOLOv8n (ONNX, CPU) for vehicle detection. A **local vision model (ollama)** gives a
+second opinion before every "empty" alert — YOLO misses dark cars at night, so the VLM
+gate suppresses those false positives. Designed for a modest homeserver.
 
 ## Architecture
 
@@ -64,7 +67,24 @@ deactivate && rm -rf /mnt/models/.export-venv /mnt/models/.export-cache /mnt/mod
 container finds the weights there. For non-Docker runs, set
 `PARKING_MODEL_PATH=/mnt/models/yolov8n.onnx`.
 
-### 3. ROI polygons (on the homeserver)
+### 3. Vision model for verification (one-time, on the homeserver)
+The bot asks a **local ollama vision model** to confirm each "empty" call and to log
+accuracy. Its weights **must** live on `/mnt/models` (the root disk is ~97% full), so
+start the ollama server with `OLLAMA_MODELS=/mnt/models` and pull the model there:
+
+```bash
+export OLLAMA_MODELS=/mnt/models
+ollama serve &                     # if not already running as a service
+ollama pull llava:7b               # or qwen2.5vl:7b — set it in config.yaml `verify.model`
+curl http://localhost:11434/api/tags   # confirm the model is listed
+```
+
+Verify the blobs landed on the models disk (`ls /mnt/models/manifests`) and root free
+space did **not** drop. In Docker the bot reaches host ollama via `host.docker.internal`
+(`OLLAMA_URL` in `.env`, already wired in `docker-compose.yml`); for a bare run set
+`OLLAMA_URL=http://localhost:11434`. To disable verification, set `verify.enabled: false`.
+
+### 4. ROI polygons (on the homeserver)
 The two spots in `config.yaml` ship with **placeholder** polygons. Capture a real
 frame and read off the corner pixel coordinates:
 ```bash
@@ -75,7 +95,7 @@ Open each JPEG, read the polygon corners in pixel coordinates, and paste them
 into the matching spot's `polygon:` in `config.yaml`. Polygons are in each
 frame's own pixel space (ch1 = 960×1080, ch3 = 960×576).
 
-### 4. Run with Docker (recommended)
+### 5. Run with Docker (recommended)
 ```bash
 docker compose up -d --build
 docker compose logs -f
@@ -97,7 +117,9 @@ python -m parkingbot
 - `cameras` — channel → label map shown by `/cameras` (currently live: 1, 2, 3).
 - `spots` — the two parking spots with ROI polygons.
 - `detection` — model path, thresholds, vehicle classes, ROI overlap threshold.
-- `push` — poll interval, debounce frames, alert policy (`free_only`).
+- `push` — poll interval (30 min), debounce frames, alert policy (`free_only`).
+- `verify` — local VLM second opinion: `model`, `gate` (suppress false "empty"),
+  `audit` (log agreement), `fail_open`, and the accuracy `log_path`.
 - `inference.omp_num_threads` — CPU thread cap.
 
 ## Gotchas (from field research)
@@ -105,8 +127,13 @@ python -m parkingbot
 - **One bot instance only** — duplicate long-pollers cause Telegram 409 conflicts.
 - **Pin the XVR's IP** before trusting `NVR_IP` (it has drifted before).
 - **URL-encode** special chars in the RTSP password (handled automatically in code).
-- **Night detection** of COCO-trained YOLO on grayscale IR frames is weaker —
-  validate after dark and tune thresholds (Phase 4).
+- **Night detection** of COCO-trained YOLO on grayscale IR frames is weaker — it misses
+  dark/top-down parked cars and false-reports "empty". The **VLM gate** (`verify:`) is
+  the fix; per-time-of-day thresholds remain a future option. See `docs/DECISIONS.md`
+  (2026-07-01).
+- **ollama must be reachable** from the bot, and its model must be on `/mnt/models`
+  (`OLLAMA_MODELS`). If it's down, `verify.fail_open` still sends alerts, tagged
+  "(doğrulanamadı)".
 
 See `parking-bot-plan.md` for the full research/handoff doc and `docs/DECISIONS.md`
 for the running decisions log.

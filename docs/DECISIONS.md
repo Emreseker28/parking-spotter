@@ -47,5 +47,32 @@ Lightweight cross-session memory. Append a short entry per phase / decision.
 ### Still TODO on the homeserver
 - [ ] Pin the XVR static IP and set `NVR_IP` in `.env` (plan §9).
 - [x] Capture real ROI polygons (done 2026-06-30; re-measure if cameras move).
-- [ ] Verify an EMPTY frame reads BOŞ for both spots (no false positives).
-- [ ] Night-frame test (plan §9) → Phase 4 tuning (per-time-of-day thresholds).
+- [x] Verify an EMPTY frame reads BOŞ for both spots — now gated by the VLM verifier.
+- [x] Night-frame handling — addressed via the VLM second-opinion gate (below) instead
+      of per-time-of-day thresholds (kept as a future option).
+
+## 2026-07-01 — Night false positives → VLM gate + accuracy auditor
+
+- **Symptom:** overnight the bot sent **11 false "BOŞ" (empty)** alerts for two spots
+  that were occupied by the owner's cars.
+- **Root cause:** *not* passers-by mistaken for empty spaces — the opposite. At night
+  YOLOv8n **misses the dark / top-down parked cars**, so ROI coverage drops below
+  `roi_overlap_threshold` (0.15) → spot scored FREE → `free_only` fires "BOŞ". The
+  detection flickered across the night; each occupied→free flip = one alert (11 flaps).
+  `debounce_frames: 2` at a 4-min cadence (~8 min) was too short to smooth it.
+- **Fix (this change):**
+  1. Cadence `interval_minutes` 4 → **30**, `debounce_frames` 2 → **3**.
+  2. **VLM gate** — a local ollama vision model (`llava:7b`, config `verify:`) crops the
+     spot ROI and judges occupied/empty. Before any "BOŞ" alert, if the VLM sees a car
+     the alert is **suppressed**. `fail_open` sends a tagged "(doğrulanamadı)" alert if
+     the VLM is unreachable, so real frees are never lost. New `parkingbot/verifier.py`.
+  3. **Accuracy auditor** — every poll logs bot-vs-VLM agreement to
+     `data/parking-accuracy.jsonl`; `/accuracy` reports a credibility score + how many
+     false "BOŞ" the gate blocked.
+- **Model location:** the VLM weights **must** live on `/mnt/models` (root disk ~97%).
+  Run ollama with `OLLAMA_MODELS=/mnt/models` and
+  `OLLAMA_MODELS=/mnt/models ollama pull llava:7b`. Docker reaches host ollama via
+  `host.docker.internal` (`extra_hosts` + `OLLAMA_URL`). The accuracy log goes to a
+  writable `./data` volume, **not** the read-only `/mnt/models` mount.
+- **Future option:** per-time-of-day thresholds / a night-trained YOLO if the gate isn't
+  enough (see plan research notes).
