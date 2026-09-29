@@ -76,3 +76,55 @@ Lightweight cross-session memory. Append a short entry per phase / decision.
   writable `./data` volume, **not** the read-only `/mnt/models` mount.
 - **Future option:** per-time-of-day thresholds / a night-trained YOLO if the gate isn't
   enough (see plan research notes).
+
+## 2026-09-29 — Improvement plan Phase 0: baseline + housekeeping
+
+**Precondition fix (not in the plan):** the bot was found BROKEN — `yolov8n.onnx`
+was gone (`/mnt/models` recreated ~Sep 27-28; model absent everywhere on disk), so
+every push poll failed "Model not found" while capture kept working. Restored via
+the documented throwaway-venv export (staged in /tmp because `/mnt/models` is
+root-owned and there is no passwordless sudo; user ran the `sudo cp` + data-dir
+commands). Model validated (ort load check) and the 18:51 poll ran clean.
+Also noted: root SSD is at 59% (42G free), not the ~97% the plan assumed;
+`/mnt/models` is a plain dir on the root LV, not a separate mount.
+
+**Changes (all behind the working agreement: flags default off / rollback = flip flag):**
+1. Data dir moved off root: compose volume `/mnt/storage/parking-spotter/data:/app/data`
+   (was `./data`). Migration was a verified no-op (no existing JSONL anywhere).
+2. Log rotation: new `parkingbot/jsonl.py::append_jsonl` — size-based (10 MB default,
+   keep 3 generations). Accuracy log writes go through it (`verify.log_max_mb`/`log_keep`).
+   Unit-tested; live path first exercises when audit/feedback logging is enabled.
+3. Push state persistence: new `parkingbot/push_state.py` — atomic temp+rename write,
+   freshness-checked load (`push.state_path`, `push.state_max_age_hours: 24`). Bot
+   restores on startup, saves after every poll.
+4. Baseline measured (below).
+5. Snapshot API test: **works** — HTTP 200, image/jpeg, ~10 KB, valid baseline JPEG
+   on both ch1 and ch3. **Caveat: 352x288** (substream-class), NOT the mainstream
+   960x1080/960x576 the ROI polygons are defined for — Phase 4 must rescale polygons
+   or assert-and-fallback.
+
+**Baseline (2026-09-29 ~18:20-19:00 UTC, night, IR):**
+| Metric | Value |
+|---|---|
+| Container RSS (idle, after first poll) | 105.2 MiB / 1 GiB |
+| Container RSS (peak during poll) | 114.9 MiB |
+| Container CPU (during poll) | ~78% (of 2-core limit) |
+| Host MemAvailable (idle) | 3.6-3.7 GiB |
+| Host MemAvailable (dip during poll) | ~3.61 GiB (≈90 MiB) |
+| ffmpeg grab time | ch1 1.25s, ch3 1.31s |
+| Push poll wall time | 3.4s (18:51 poll), 3.72s (instrumented) |
+| /parking wall time | same code path as push poll + Telegram I/O |
+
+**Live failure captured for later phases:** at 21:23 local (night IR), ev önü read
+BOŞ cov=0.00 while a light SUV was clearly visible inside the ROI (frame +
+ROI-overlay saved in `.superpowers/sdd/improvement-plan/baseline-frames/`) — zero
+detections on full-frame AND crop pass. Spot A read DOLU cov=0.62 (correct). This is
+the plan's target failure, recorded with evidence for Phase 2 (stability gate) and
+Phase 7 (fine-tune dataset).
+
+**Acceptance:** restart mid-cycle verified — after `docker restart`, the log shows
+"restored push state from /app/data/push_state.json" and the state file (on
+/mnt/storage) survived; no spurious re-baseline. Log rotation unit-tested (8 tests).
+Root SSD usage from the bot's data: ~0 (all writes via the /mnt/storage mount).
+
+**Decision: keep.** Tests: `python -m unittest discover -s tests` → 20/20.
