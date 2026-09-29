@@ -82,6 +82,18 @@ class Detector:
         # cache of (h, w, spot.name) -> (roi_mask, roi_area)
         self._roi_cache: dict[tuple[int, int, str], tuple[np.ndarray, int]] = {}
 
+        # Tier-2 detector (Phase 3): a bigger model (yolov8s) used ONLY on the rare
+        # pending-free path, with a lower confidence threshold. Lazily loaded and
+        # unloaded after each use so it never stays resident.
+        t2 = settings.detection_tier2
+        self._tier2_enabled = bool(t2.get("enabled", False))
+        raw_t2 = str(t2.get("model_path", "models/yolov8s.onnx"))
+        p2 = Path(raw_t2)
+        self._tier2_path = p2 if p2.is_absolute() else (ROOT / p2)
+        self._tier2_conf = float(t2.get("conf_threshold", 0.15))
+        self._tier2_session = None
+        self._tier2_input_name = None
+
     # ---------------------------------------------------------------- model
     def _ensure_session(self):
         if self._session is not None:
@@ -104,6 +116,71 @@ class Detector:
         self._input_name = self._session.get_inputs()[0].name
         log.info("Loaded ONNX model %s (threads=%d)", self._model_path, threads)
 
+    # ------------------------------------------------------------- tier-2
+    def _ensure_tier2(self):
+        if self._tier2_session is not None:
+            return self._tier2_session
+        if not self._tier2_path.exists():
+            raise FileNotFoundError(f"Tier-2 model not found at {self._tier2_path}")
+        import onnxruntime as ort
+
+        threads = int(self._s.inference.get("omp_num_threads", 2))
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = threads
+        opts.inter_op_num_threads = 1
+        self._tier2_session = ort.InferenceSession(
+            str(self._tier2_path), sess_options=opts, providers=["CPUExecutionProvider"]
+        )
+        self._tier2_input_name = self._tier2_session.get_inputs()[0].name
+        log.info("Loaded tier-2 ONNX model %s (threads=%d)", self._tier2_path, threads)
+
+    def unload_tier2(self) -> None:
+        """Release the tier-2 session so it does not stay resident."""
+        self._tier2_session = None
+        self._tier2_input_name = None
+
+    def check_spot_tier2(self, img: np.ndarray, spot: Spot) -> SpotResult | None:
+        """Run the tier-2 detector (yolov8s, lower conf) on the ROI crop only.
+
+        Used only on the rare pending-free path. The session is unloaded after use.
+        Returns a SpotResult, or None if tier-2 is unavailable (missing model,
+        disabled, ...). Never raises.
+        """
+        if not self._tier2_enabled or img is None:
+            return None
+        try:
+            session = self._ensure_tier2()
+        except Exception as exc:  # noqa: BLE001 - degrade to "no tier-2 verdict"
+            log.warning("tier2: could not load %s: %s", self._tier2_path, exc)
+            return None
+        try:
+            h, w = img.shape[:2]
+            x0, y0, x1, y1 = self._roi_bbox(spot, (h, w), self._crop_pad)
+            if x1 <= x0 or y1 <= y0:
+                return None
+            crop = img[y0:y1, x0:x1]
+            up = self._crop_upscale
+            if up != 1.0:
+                crop = cv2.resize(crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+            tensor, scale, pad_x, pad_y = self._preprocess(crop)
+            output = session.run(None, {self._tier2_input_name: tensor})[0]
+            dets = self._postprocess(output, scale, pad_x, pad_y, conf_override=self._tier2_conf)
+            mapped = [
+                Detection(box=(b.box[0] / up + x0, b.box[1] / up + y0,
+                             b.box[2] / up + x0, b.box[3] / up + y0),
+                          score=b.score, cls=b.cls)
+                for b in dets
+            ]
+            mask, area = self._roi_mask(spot, (h, w))
+            cov = self._coverage(mask, area, mapped, (h, w))
+            return SpotResult(spot=spot, occupied=cov >= self._overlap_thr,
+                              coverage=cov, detections=mapped, frame=img)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tier2: detection failed for %r: %s", spot.name, exc)
+            return None
+        finally:
+            self.unload_tier2()
+
     # ----------------------------------------------------------- pre/post
     def _letterbox(self, img: np.ndarray):
         """Resize keeping aspect ratio, pad to a square `input`x`input`."""
@@ -123,7 +200,8 @@ class Detector:
         tensor = np.transpose(tensor, (2, 0, 1))[None]  # NCHW
         return np.ascontiguousarray(tensor), scale, pad_x, pad_y
 
-    def _postprocess(self, output: np.ndarray, scale, pad_x, pad_y) -> list[Detection]:
+    def _postprocess(self, output: np.ndarray, scale, pad_x, pad_y,
+                     conf_override: float | None = None) -> list[Detection]:
         # YOLOv8 ONNX output: (1, 84, 8400) -> transpose to (8400, 84).
         preds = np.squeeze(output, 0).T  # (8400, 84)
         boxes_xywh = preds[:, :4]
@@ -131,7 +209,8 @@ class Detector:
         cls_ids = np.argmax(class_scores, axis=1)
         confs = class_scores[np.arange(class_scores.shape[0]), cls_ids]
 
-        keep = (confs >= self._conf) & np.isin(cls_ids, list(self._vehicle))
+        conf = self._conf if conf_override is None else conf_override
+        keep = (confs >= conf) & np.isin(cls_ids, list(self._vehicle))
         if not np.any(keep):
             return []
         boxes_xywh, confs, cls_ids = boxes_xywh[keep], confs[keep], cls_ids[keep]
@@ -145,7 +224,7 @@ class Detector:
 
         # NMS via OpenCV (expects x,y,w,h boxes).
         rects = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).tolist()
-        idxs = cv2.dnn.NMSBoxes(rects, confs.tolist(), self._conf, self._nms_iou)
+        idxs = cv2.dnn.NMSBoxes(rects, confs.tolist(), conf, self._nms_iou)
         if len(idxs) == 0:
             return []
         idxs = np.array(idxs).flatten()

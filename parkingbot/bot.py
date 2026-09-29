@@ -92,6 +92,11 @@ class ParkingBot:
         self._crop_pad = float(settings.detection.get("crop_pad", 0.15))
         # "frame_id:spot_idx" -> {coverage, context, occupied} for callback lookups
         self._frame_index: dict[str, dict] = {}
+
+        # Tier-2 detector + RAM guard (Phase 3).
+        t2 = settings.detection_tier2
+        self._tier2_on = bool(t2.get("enabled", False))
+        self._tier2_min_mb = float(t2.get("min_available_mb", 2500))
         # Accuracy log (bot-vs-VLM). Relative paths resolve against the repo root;
         # never /mnt/models (read-only in Docker).
         raw_log = str(settings.verify.get("log_path", "data/parking-accuracy.jsonl"))
@@ -104,6 +109,19 @@ class ParkingBot:
             return {}
         log.info("restored push state from %s", self._push_state_path)
         return state
+
+    @staticmethod
+    def _mem_available_mb() -> float:
+        """Host MemAvailable in MB (containers share the host kernel, so
+        /proc/meminfo reflects the host). Fail-open (inf) if unreadable."""
+        try:
+            with open("/proc/meminfo", encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / 1024.0
+        except (OSError, ValueError, IndexError):
+            log.warning("could not read MemAvailable from /proc/meminfo")
+        return float("inf")
 
     # ------------------------------------------------------------- feedback
     def _save_feedback_crop(self, r: SpotResult, spot_idx: int, ts: float,
@@ -252,6 +270,15 @@ class ParkingBot:
         if self._feedback_enabled and self._feedback_log.exists():
             report = build_accuracy_report(days, self._read_jsonl(self._feedback_log))
             if report:
+                # Surface tier-2 rescues (logged to the accuracy log).
+                cutoff = time.time() - days * 86400
+                t2_rescues = sum(
+                    1 for rec in self._read_jsonl(self._audit_log)
+                    if rec.get("type") == "tier2_override"
+                    and float(rec.get("ts", 0)) >= cutoff
+                )
+                if t2_rescues:
+                    report += f"\n• Tier-2 ile düzeltilen yanlış 'BOŞ': *{t2_rescues}*"
                 parts.append(report)
         if self.verifier.enabled and self._audit_log.exists():
             vlm = self._format_vlm_accuracy(days)
@@ -418,6 +445,32 @@ class ParkingBot:
             transition_to_free = now == "free"
             if policy == "free_only" and not transition_to_free:
                 continue
+
+            # Phase 3: RAM guard + tier-2 detector (only on a pending free flip).
+            # Like every gate here, these can only SUPPRESS a free alert, never
+            # create one — a failing gate can't spam.
+            if transition_to_free and self._tier2_on:
+                mem = self._mem_available_mb()
+                if mem < self._tier2_min_mb:
+                    log.info(
+                        "ram_defer: %r MemAvailable %.0f MB < %.0f MB, deferring free alert",
+                        r.spot.name, mem, self._tier2_min_mb,
+                    )
+                    st["confirmed"] = prev  # revert; retry next poll
+                    continue
+                t2 = self.detector.check_spot_tier2(r.frame, r.spot)
+                if t2 is not None and t2.occupied:
+                    log.info(
+                        "tier2_override: %r tier-2 sees a car (cov %.2f)",
+                        r.spot.name, t2.coverage,
+                    )
+                    self._append_log({
+                        "type": "tier2_override",
+                        "spot": r.spot.name,
+                        "tier2_coverage": round(t2.coverage, 4),
+                    })
+                    st["confirmed"] = prev  # revert so we re-check next poll
+                    continue
 
             # GATE: don't cry "BOŞ" unless the VLM agrees the spot is empty. This is
             # what kills the night false positives (YOLO misses a dark car -> FREE).

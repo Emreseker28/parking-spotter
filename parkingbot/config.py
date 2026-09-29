@@ -75,6 +75,10 @@ class Settings:
         return self.raw.get("stability", {})
 
     @property
+    def detection_tier2(self) -> dict:
+        return self.raw.get("detection_tier2", {})
+
+    @property
     def inference(self) -> dict:
         return self.raw.get("inference", {})
 

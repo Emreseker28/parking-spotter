@@ -124,3 +124,12 @@ stability:
   ref_width: 160              # reference crop width in px
   min_coverage: 0.5           # refresh the reference when a reading is occupied
                               # with coverage >= this (strong occupied signal)
+
+# Tier-2 detector (Phase 3): a bigger model (yolov8s) used ONLY on the rare
+# pending-free path, with a lower confidence threshold, behind a RAM guard.
+# The session is unloaded after each use. Default off until Phase 3 is accepted.
+detection_tier2:
+  enabled: false
+  model_path: "models/yolov8s.onnx"
+  conf_threshold: 0.15
+  min_available_mb: 2500      # defer the free alert below this host MemAvailable
