@@ -133,6 +133,7 @@ class Detector:
         )
         self._tier2_input_name = self._tier2_session.get_inputs()[0].name
         log.info("Loaded tier-2 ONNX model %s (threads=%d)", self._tier2_path, threads)
+        return self._tier2_session
 
     def unload_tier2(self) -> None:
         """Release the tier-2 session so it does not stay resident."""

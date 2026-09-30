@@ -62,6 +62,25 @@ class Tier2SessionTest(unittest.TestCase):
             d.unload_tier2()
             self.assertIsNone(d._tier2_session)
 
+    def test_ensure_tier2_returns_session(self):
+        """Regression: _ensure_tier2 must RETURN the session (a missing return made
+        check_spot_tier2 crash with 'NoneType' object has no attribute 'run')."""
+        from unittest.mock import MagicMock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "yolov8s.onnx"
+            model.write_bytes(b"dummy")  # path must exist; content is mocked
+            d = _detector(Path(tmp), tier2_path=str(model))
+            fake_session = MagicMock()
+            input_mock = MagicMock()
+            input_mock.name = "images"
+            fake_session.get_inputs.return_value = [input_mock]
+            with patch("onnxruntime.InferenceSession", return_value=fake_session):
+                result = d._ensure_tier2()
+            self.assertIs(result, fake_session)
+            self.assertIs(d._tier2_session, fake_session)
+            self.assertEqual(d._tier2_input_name, "images")
+
 
 class PostprocessConfOverrideTest(unittest.TestCase):
     def test_conf_override_filters_detections(self):

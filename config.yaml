@@ -129,7 +129,7 @@ stability:
 # pending-free path, with a lower confidence threshold, behind a RAM guard.
 # The session is unloaded after each use. Default off until Phase 3 is accepted.
 detection_tier2:
-  enabled: false
+  enabled: true               # Phase 3 accepted 2026-09-30 (see DECISIONS.md)
   model_path: "models/yolov8s.onnx"
   conf_threshold: 0.15
   min_available_mb: 2500      # defer the free alert below this host MemAvailable
