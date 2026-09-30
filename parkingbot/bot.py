@@ -352,8 +352,12 @@ class ParkingBot:
         loop = asyncio.get_running_loop()
         results: list[SpotResult] = []
         for ch in channels:
-            jpeg = await self.capture.grab(ch, subtype)
             ch_spots = [s for s in self.settings.spots if s.channel == ch]
+            # ROI safety check (Phase 4): the detection path expects the mainstream
+            # frame size the ROI polygons are defined in. A snapshot frame of a
+            # different size is rejected inside grab() and falls back to ffmpeg.
+            expected = ch_spots[0].frame_size if ch_spots else None
+            jpeg = await self.capture.grab(ch, subtype, expected_size=expected)
 
             def _detect_channel(jpeg=jpeg, ch_spots=ch_spots):
                 img = self.detector.decode(jpeg)

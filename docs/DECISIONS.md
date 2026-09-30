@@ -226,3 +226,34 @@ Tier-2 runs only on pending free flips (a few/day); the live week measures the
 ❌ drop on "BOŞ" alerts.
 
 **Decision: keep.**
+
+## 2026-09-30 — Improvement plan Phase 4: HTTP snapshot capture
+
+**Plan-premise correction:** the Phase 0 curl test showed the snapshot API works but
+returns **352x288** (a fixed low-res thumbnail), NOT the mainstream 960x1080/960x576
+the ROI polygons are defined for. So the snapshot cannot be used for detection (the
+polygons don't apply to a 352x288 frame). The ROI safety check (task 2) is exactly
+what catches this.
+
+**Implementation:** `capture.method: auto|snapshot|rtsp`. Snapshot path uses
+`httpx.DigestAuth` against `/cgi-bin/snapshot.cgi?channel=N` (keeps the global
+lock). `auto` tries the snapshot first, falls back to ffmpeg on error, invalid
+JPEG, or size mismatch. `expected_size=(w,h)` (the detection path, from
+`spot.frame_size`) triggers the ROI safety check. A per-channel size cache skips
+the snapshot after a known mismatch (avoids wasting an HTTP grab every poll).
+
+**Measured (2026-09-30):**
+- Viewer grab: snapshot **0.85s** vs ffmpeg substream **3.54s** — ~4x faster.
+- Detection grab: ffmpeg-only **3.50s/2ch** (unchanged — the snapshot mismatches the
+  polygon coords and falls back). First auto poll 5.47s (snapshot discovery), then
+  the cache skips it.
+- Without the cache, the snapshot attempt added **+2.24s** to the detection grab
+  (5.63s vs 3.39s) — a 66% regression on the primary path. The cache removes it.
+
+**Acceptance:** viewer grab time measurably lower (0.85s vs 3.54s). Detection results
+unchanged (uses ffmpeg). Fallback tested via unit tests (size mismatch + snapshot
+error). The plan's "20 paired frames, same size" is adapted: the snapshot (352x288)
+is compared against the ffmpeg substream (352x288) for the viewer; detection stays
+on ffmpeg.
+
+**Decision: keep** (with the documented premise correction + per-channel cache).

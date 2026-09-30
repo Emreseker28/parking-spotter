@@ -18,9 +18,13 @@ rtsp:
   timeout_seconds: 30       # generous: recorder can be slow to first frame
 
 capture:
+  method: auto              # auto | snapshot | rtsp (Phase 4). auto = try the HTTP
+                            # snapshot first, fall back to ffmpeg on error,
+                            # invalid JPEG, or a size mismatch (ROI safety check).
   viewer_subtype: 1         # substream (light) for /cameras quick glance
   detect_subtype: 0         # mainstream (full detail) for /parking + push
   jpeg_quality: 2           # ffmpeg -q:v, lower = better quality
+  snapshot_timeout_seconds: 10
 
 detection:
   # In Docker, /app/models is mounted from /mnt/models (the dedicated models

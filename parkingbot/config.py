@@ -36,6 +36,7 @@ class Spot:
     name: str
     channel: int
     polygon: list[tuple[int, int]]
+    frame_size: tuple[int, int] | None = None  # (width, height) of the mainstream frame
 
 
 @dataclass(frozen=True)
@@ -118,8 +119,11 @@ def _parse_spots(raw: dict) -> list[Spot]:
             raise ConfigError(
                 f"Spot {entry.get('name')!r} polygon needs >=3 points."
             )
+        fs = entry.get("frame_size")
+        frame_size = (int(fs[0]), int(fs[1])) if fs else None
         spots.append(
-            Spot(name=str(entry["name"]), channel=int(entry["channel"]), polygon=poly)
+            Spot(name=str(entry["name"]), channel=int(entry["channel"]),
+                   polygon=poly, frame_size=frame_size)
         )
     if not spots:
         raise ConfigError("config.yaml defines no parking spots.")
