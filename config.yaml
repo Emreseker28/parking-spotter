@@ -60,13 +60,17 @@ spots:
 
 push:
   enabled: true
-  interval_minutes: 30       # poll cadence (raised from 4 -> 30 to stop night flicker)
+  interval_minutes: 10        # base poll cadence (Phase 5: was 30)
+  confirm_interval_minutes: 2 # adaptive: while a flip is pending, re-poll this often
+                             # until the debounce resolves (3 x 2 min = ~6 min latency)
   debounce_frames: 3         # consecutive agreeing polls before flipping state.
-                             # At 30 min/poll a FREE state must persist ~1-1.5h before
-                             # alerting. The VLM gate below is the primary false-positive
-                             # defense, so drop this to 2 if you want faster alerts.
   # Decision: notify ONCE when a spot transitions to FREE, then stay quiet.
   policy: free_only          # free_only | all_changes
+  # Optional night hours (Phase 5): longer interval at night for less CPU/noise.
+  # 0 disables. Range wraps midnight (23 -> 06).
+  night_interval_minutes: 0
+  night_start_hour: 23
+  night_end_hour: 6
   # Debounce/transition state is persisted here (atomic write) so a container
   # restart mid-cycle does not lose the confirmed state or re-baseline.
   # Relative paths resolve against the repo root (/app/data in Docker).

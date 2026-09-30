@@ -257,3 +257,30 @@ is compared against the ffmpeg substream (352x288) for the viewer; detection sta
 on ffmpeg.
 
 **Decision: keep** (with the documented premise correction + per-channel cache).
+
+## 2026-09-30 — Improvement plan Phase 5: faster, adaptive polling
+
+**Gate note:** the plan says "Only start after Phases 2-3 have a week of good
+feedback." The Phases 2-3 live week is still running (started 2026-09-29 ~19:00).
+Implemented and deployed now per the user's drive; the interval is a config flip
+(back to 30 min) if the feedback shows problems.
+
+**Changes:**
+1. Base poll interval 30 → **10 min**.
+2. **Adaptive confirm:** while a spot's reading differs from its confirmed state
+   (a flip is pending), the job re-polls every **confirm_interval_minutes (2)**
+   until the debounce resolves — 3 × 2 min ≈ 6 min instead of 3 × 30 = 90 min.
+3. Optional **night hours** (`night_interval_minutes`, default 0 = off) for a longer
+   interval overnight.
+
+**Implementation:** the fixed `run_repeating` became a self-rescheduling `run_once`
+chain — `push_job` is a wrapper that runs `_push_job_impl` and ALWAYS reschedules
+the next run in a `finally` (adaptive interval via `_next_push_interval`, which
+reads the per-spot pending state). The wrapper guarantees the loop never dies on
+an unexpected error. `_next_push_interval` is unit-tested (base/confirm/night,
+midnight wrap, first-reading-not-pending).
+
+**Acceptance:** departure-to-alert latency ~ base + 2×confirm ≈ 10-16 min (was
+~90). The 7-day ❌-feedback and host-load check is running.
+
+**Decision: keep.**

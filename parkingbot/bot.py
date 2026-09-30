@@ -123,6 +123,34 @@ class ParkingBot:
             log.warning("could not read MemAvailable from /proc/meminfo")
         return float("inf")
 
+    def _next_push_interval(self, results_state: dict, now=None) -> float:
+        """Adaptive poll interval in seconds (Phase 5).
+
+        confirm_interval while a flip is pending (the reading differs from the
+        confirmed state and the debounce hasn't resolved), else the base interval.
+        Night hours use a longer interval (less CPU/noise).
+        """
+        push = self.settings.push
+        base = float(push.get("interval_minutes", 10)) * 60
+        confirm = float(push.get("confirm_interval_minutes", 2)) * 60
+        pending = any(
+            st.get("confirmed") is not None and st.get("candidate") != st.get("confirmed")
+            for st in results_state.values()
+        )
+        interval = confirm if pending else base
+        night = push.get("night_interval_minutes", 0)
+        if night:
+            hour = (now or time.localtime()).tm_hour
+            start = int(push.get("night_start_hour", 23))
+            end = int(push.get("night_end_hour", 6))
+            if start <= end:
+                in_night = start <= hour < end
+            else:  # range wraps midnight
+                in_night = hour >= start or hour < end
+            if in_night:
+                interval = float(night) * 60
+        return interval
+
     # ------------------------------------------------------------- feedback
     def _save_feedback_crop(self, r: SpotResult, spot_idx: int, ts: float,
                             context: str) -> str | None:
@@ -380,6 +408,20 @@ class ParkingBot:
 
     # -------------------------------------------------------------- push loop
     async def push_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Wrapper: run the poll and ALWAYS reschedule the next one (run_once
+        chain), so an unexpected error can never kill the push loop."""
+        try:
+            await self._push_job_impl(context)
+        except Exception as exc:  # noqa: BLE001 - never let the loop die
+            log.exception("push poll crashed: %s", exc)
+        finally:
+            try:
+                next_interval = self._next_push_interval(self._push_state)
+            except Exception:  # noqa: BLE001
+                next_interval = float(self.settings.push.get("interval_minutes", 10)) * 60
+            context.job_queue.run_once(self.push_job, when=next_interval)
+
+    async def _push_job_impl(self, context: ContextTypes.DEFAULT_TYPE):
         push = self.settings.push
         vcfg = self.settings.verify
         debounce = int(push.get("debounce_frames", 2))
@@ -577,8 +619,10 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(bot.on_feedback_button, pattern=f"^{CB_PREFIX[:-1]}"))
 
     if settings.push.get("enabled", False):
-        interval = float(settings.push.get("interval_minutes", 4)) * 60
-        app.job_queue.run_repeating(bot.push_job, interval=interval, first=interval)
-        log.info("Push loop enabled: every %.0fs", interval)
+        interval = float(settings.push.get("interval_minutes", 10)) * 60
+        # Self-rescheduling run_once chain: push_job reschedules itself after each
+        # run with the adaptive interval (Phase 5).
+        app.job_queue.run_once(bot.push_job, when=interval)
+        log.info("Push loop enabled: base every %.0fs (adaptive)", interval)
 
     return app
