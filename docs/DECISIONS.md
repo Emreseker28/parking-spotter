@@ -191,3 +191,38 @@ ones), so a wrong threshold can only delay a real free alert, not spam.
 (night false-"BOŞ" per ❌ feedback vs baseline) is now running.
 
 **Decision: keep.**
+
+## 2026-09-30 — Improvement plan Phase 3: tier-2 detector + RAM guard
+
+**Mechanism:** a second, lazily-loaded yolov8s session (`detection_tier2`) used
+ONLY on the rare pending-free path (a confirmed free flip that the stability gate
+did not catch), on the ROI crop with a lower conf (0.15). The session is unloaded
+after each use. Before it runs, a RAM guard reads `/proc/meminfo` MemAvailable and
+**defers** (reverts confirmed, keeps the candidate) when below
+`min_available_mb` (2500) — never fails open to an unverified alert. A rescue is
+logged as `tier2_override` and counted in /accuracy.
+
+**Export:** `scripts/export_model.py --weights yolov8s.pt` (new flag) →
+`/mnt/models/yolov8s.onnx` (44.8 MB, staged in /tmp + `sudo cp`, same root-owned
+/mnt/models procedure as the yolov8n restore).
+
+**Measured (2026-09-30 night, ev önü):**
+- `check_spot_tier2` on the night frame: **occupied=True cov=0.73** — the tier-2
+  detector sees the SUV that yolov8n missed (cov 0.00). The rescue mechanism works.
+- Wall time 0.72s (grab + tier-2 inference on the crop).
+- Container RSS: idle 48 MiB (fresh) / 105 MiB (yolov8n loaded); **peak 251 MiB**
+  during the tier-2 run (transient yolov8s session), back to 48 MiB after unload.
+  Production peak ≈ 105 + 203 = **~308 MiB** — well under the 1 GiB limit, so the
+  compose memory limit is **not** raised.
+- Host MemAvailable dipped to ~3357 MiB during the run — above the 2500 guard.
+
+**Bug found & fixed:** `_ensure_tier2` was missing its `return`, so
+`check_spot_tier2` crashed with `'NoneType' object has no attribute 'run'`. Caught
+by a live measurement, fixed, and covered by a mocked-session regression test
+(the original unit tests never exercised a successful load).
+
+**Verification:** 57/57 unit tests. Deployed with `detection_tier2.enabled: true`.
+Tier-2 runs only on pending free flips (a few/day); the live week measures the
+❌ drop on "BOŞ" alerts.
+
+**Decision: keep.**
