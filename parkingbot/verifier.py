@@ -62,6 +62,12 @@ class Verifier:
         self._model = str(v.get("model", "llava:7b"))
         self._timeout = float(v.get("timeout_seconds", 60))
         self._pad = float(v.get("crop_pad", 0.15))
+        # Backend: ollama (local) or aigate (LLM gateway -> Groq vision).
+        self._backend = str(v.get("backend", "ollama"))
+        self._aigate_url = str(v.get("aigate_url", "http://localhost:8500")).rstrip("/")
+        self._caller_id = str(v.get("aigate_caller_id", "parking-spotter"))
+        self._aigate_model = str(v.get("aigate_model", "qwen/qwen3.8-27b"))
+        self._max_tokens = int(v.get("max_tokens", 200))
 
     @property
     def enabled(self) -> bool:
@@ -92,6 +98,11 @@ class Verifier:
             log.warning("verify: crop failed for %r: %s", spot.name, exc)
             return VerifyResult(False, None, 0.0, f"crop error: {exc}")
 
+        if self._backend == "aigate":
+            return await self._verify_aigate(b64, spot)
+        return await self._verify_ollama(b64, spot)
+
+    async def _verify_ollama(self, b64: str, spot: Spot) -> VerifyResult:
         payload = {
             "model": self._model,
             "prompt": _PROMPT,
@@ -112,6 +123,42 @@ class Verifier:
             return VerifyResult(False, None, 0.0, f"ollama error: {exc}")
 
         return self._parse(str(data.get("response", "")), spot)
+
+    async def _verify_aigate(self, b64: str, spot: Spot) -> VerifyResult:
+        """Ask the AI Gate (Groq vision model) whether `spot` is occupied."""
+        payload = {
+            "model": self._aigate_model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }],
+            "max_tokens": self._max_tokens,
+            "temperature": 0,
+        }
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._aigate_url}/v1/chat/completions",
+                    json=payload,
+                    headers={"X-Caller-ID": self._caller_id},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - connection refused, timeout, etc.
+            log.warning("verify: aigate call failed for %r: %s", spot.name, exc)
+            return VerifyResult(False, None, 0.0, f"aigate error: {exc}")
+
+        content = ""
+        try:
+            content = str(data["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError):
+            pass
+        return self._parse(content, spot)
 
     @staticmethod
     def _parse(raw: str, spot: Spot) -> VerifyResult:

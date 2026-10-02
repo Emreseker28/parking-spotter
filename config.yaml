@@ -85,18 +85,24 @@ push:
 # where YOLO misses dark/top-down cars). (2) AUDIT — every poll, log bot-vs-VLM agreement
 # so /accuracy can report how trustworthy the bot is.
 verify:
-  enabled: false      # DISABLED 2026-07-01: local VLM is unviable on this box (i3-4170, 2 cores,
-                      # 7.5GiB RAM, no GPU). moondream swap-thrashed all cores and did not return a
-                      # verdict in 180s warm; sustained draw tripped a power shutdown. To re-enable,
-                      # OFFLOAD ollama to a capable LAN host and set OLLAMA_URL to it (keeps frames on-net).
-  backend: ollama
+  enabled: true       # Phase 6 (2026-10-01): VLM gate via AI Gate -> Groq vision.
+                      # Local ollama was unviable on this box (2026-07-01); the gate now runs
+                      # in the CLOUD via AI Gate (explicit opt-in: ROI crops leave the LAN).
+  backend: aigate
   ollama_url: "http://localhost:11434"   # env OLLAMA_URL overrides (Docker: host.docker.internal)
-  model: "moondream"                      # weights MUST live on /mnt/models (see README/DECISIONS); moondream chosen: qwen2.5vl:3b needs ~10GiB (> 7.5GiB total RAM) on this CPU-only box
-  timeout_seconds: 60
+  model: "moondream"                      # ollama model (only used when backend: ollama)
+  timeout_seconds: 90
   gate: true          # suppress a FREE alert if the VLM says the spot is occupied
-  audit: true         # log bot-vs-VLM agreement every poll (credibility score)
+  audit: false        # OFF: the audit would send a crop to the cloud EVERY poll
+                      # (144/day). The GATE alone runs only on pending free flips
+                      # (a few/day). /accuracy uses feedback.jsonl (Phase 1).
   fail_open: true     # if the VLM is unreachable, SEND the alert (tagged) rather than lose a real free
   crop_pad: 0.15      # expand the ROI bbox by this fraction before cropping (matches detector)
+  # AI Gate backend (Groq vision model). Caller + model configured in AI Gate.
+  aigate_url: "http://localhost:8500"            # AI Gate is network_mode: host (this container is too)
+  aigate_caller_id: "parking-spotter"
+  aigate_model: "qwen/qwen3.8-27b"
+  max_tokens: 200
   # Writable path for the accuracy log. Relative paths resolve against the repo root.
   # NOT /mnt/models — that disk is mounted read-only in Docker.
   log_path: "data/parking-accuracy.jsonl"

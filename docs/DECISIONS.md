@@ -284,3 +284,43 @@ midnight wrap, first-reading-not-pending).
 ~90). The 7-day ❌-feedback and host-load check is running.
 
 **Decision: keep.**
+
+## 2026-10-02 — Improvement plan Phase 6: VLM gate via AI Gate (Groq vision)
+
+**Decision:** route the VLM gate through **AI Gate** (the user's LLM gateway) to a
+**Groq vision model** — not a local ollama (6A). The user's words: "this vlm needs
+to be configured under ai-gate and all request should go there." (AI Gate is the
+user's own service; the source is on the host at /home/likewhosloss/ai-gate.)
+
+**AI Gate changes (separate repo, backward-compatible):**
+- `app/api/v1_chat.py`: `ChatMessage.content` `str` → `Union[str, list]` so the
+  OpenAI vision array (text + image_url parts) is accepted. The token counter
+  already handled the list form; the Groq client forwards it as-is.
+- `config/models.yaml`: `qwen/qwen3.8-27b` is the vision model (modality chat →
+  multimodal, added `vision` alias). Removed the incorrect `vision` alias from
+  `openai/gpt-oss-20b` (a reasoning/text model — it 400'd on images).
+- `config/callers.yaml`: added `parking-spotter` caller (50k tokens/$2 per day).
+
+**Verifier (`parkingbot/verifier.py`):** added `verify.backend: ollama | aigate`.
+The aigate path POSTs the ROI crop to `/v1/chat/completions` with `X-Caller-ID:
+parking-spotter`, model `qwen/qwen3.8-27b`, OpenAI vision format. Same
+`VerifyResult` interface; the push loop's GATE/AUDIT logic is unchanged.
+
+**Networking:** the parking-spotter container was on an isolated bridge
+(172.23.0.0/16) and could not reach the host's AI Gate. AI Gate uses
+`network_mode: host`, so the container now uses `network_mode: host` too
+(`aigate_url: http://localhost:8500`).
+
+**Measured (2026-10-02):** car frame → `occupied=True` conf 0.90; empty frame →
+`occupied=False`. Latency ~0.4-1.3s. Cost ~$0.002/call (807 tokens). The GATE runs
+only on pending free flips (a few/day). The AUDIT is **off** — it would send a crop
+to the cloud every poll (144/day); /accuracy uses feedback.jsonl (Phase 1).
+
+**Gate order (end state):** stability (pre-debounce) → debounce → RAM guard →
+tier-2 → **VLM (AI Gate)** → alert. Each gate can only suppress a free alert.
+
+**Acceptance:** latency + cost recorded. Residual false-free rate vs Phase 3 is
+being measured in the live week. Frames leave the LAN for the ROI crop on pending
+free flips only (explicit opt-in).
+
+**Decision: keep** (watch the live false-free rate and the AI Gate budget).

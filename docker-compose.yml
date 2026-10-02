@@ -10,10 +10,9 @@ services:
     env_file:
       - .env
 
-    # ollama runs on the HOST; reach it from the container via host.docker.internal.
-    # OLLAMA_URL in .env should point at http://host.docker.internal:11434.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # AI Gate runs on the HOST with network_mode: host; put this container on the
+    # host network too so it can reach AI Gate (and ollama) via localhost.
+    network_mode: host
 
     volumes:
       # ONNX weights live on the dedicated models disk (/mnt/models), NOT in the
