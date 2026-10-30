@@ -43,6 +43,8 @@ class SpotTracker:
         self.last_alert_ts = 0.0
         self.free_since: float | None = None
         self.saw_occupied = False   # an occupied reading was seen this watch session
+        self.just_arrived = False   # set on a confirmed free -> occupied flip; the engine clears it
+        self.quiet_next_free = False   # swallow the next free alert (the owner just drove off)
 
     @property
     def needs_confirm(self) -> bool:
@@ -71,6 +73,8 @@ class SpotTracker:
             self.pending_free = 0
             self.saw_occupied = True
             self.confirmed = OCCUPIED
+            if was == FREE:
+                self.just_arrived = True
             if was == FREE and self.alerted and not muted:
                 events.append(TrackerEvent("taken"))
             if was != OCCUPIED:
@@ -92,7 +96,10 @@ class SpotTracker:
             self.alerted = True
             self.last_alert_ts = now
             self.reminders = 0
-            events.append(TrackerEvent("free_alert", immediate=not self.saw_occupied))
+            if self.quiet_next_free:         # they know: they just left it
+                self.quiet_next_free = False
+            else:
+                events.append(TrackerEvent("free_alert", immediate=not self.saw_occupied))
         elif self.reminders < self.remind_max and now - self.last_alert_ts >= self.remind_every:
             self.reminders += 1
             self.last_alert_ts = now

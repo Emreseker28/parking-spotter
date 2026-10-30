@@ -1140,7 +1140,7 @@ For the running decisions log, see `docs/DECISIONS.md`.*
 
 ---
 
-## 19. Spot Watch & Guard modes (2026-10-30: Phase 0 probes, Phase 1 SPOT_WATCH, Phase 2 GUARD)
+## 19. Spot Watch & Guard modes (2026-10-30: Phases 0-3)
 
 Two new runtime modes are planned: **SPOT_WATCH** (alert when a watched spot frees up, ~60 s cadence,
 both ch1 and ch3 spots) and **GUARD** (near-continuous watch for suspicious activity around the
@@ -1172,3 +1172,13 @@ Turkish alerts with an explicit severity (BİLGİ / UYARI / ALARM); ALARM repeat
 `guard_limiter.py`, `guard_geometry.py`, `night.py`; new config section `guard:`; the 320 model is
 mounted from `/mnt/storage/parking-spotter/models` at `/app/models-guard`. Person detection on
 the real cameras still needs a live walk-through (see the DECISIONS Phase 2 entry).
+
+**Phase 3 (implemented, pending deploy): teach the car + auto-switching + CAR_GONE.** `/enroll`
+stores appearance vectors (never images) of the owner's car per spot and condition (day / night-IR /
+rain); with `/auto` on, a new car parking in a watched spot is scored against them: high = switch to
+GUARD (with an undo button), medium = "is this your car?" (no answer in 5 min = GUARD), low = ignored.
+Inside GUARD a substream presence check notices a vanished car: ALARM "ARAÇ GİTTİ" with
+[Bendim]/[Ben değilim] (louder after 2 min), or a quiet hand-over to SPOT_WATCH when the owner paused
+and the car has been gone ~90 s. Files: `appearance.py`, `car_store.py`, `matcher.py`, `autoswitch.py`,
+`carfinder.py`, `guard_presence.py`; config sections `auto:` and the CAR_GONE keys under `guard:`.
+Hard-negative accuracy (same model in the same spot) is untested; see the DECISIONS Phase 3 entry.

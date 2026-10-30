@@ -510,3 +510,65 @@ stops vetoing so a wrong mapping can delay an alert but never swallow it.
 **Honest value:** small. ch1 is already reliable at night, and ch3's view of that car is flaky, so this
 mostly guards against a rare ch1 false-free. It costs ~1 s CPU only on a free reading. Tests: 224/224
 (8 new). Not deployed (needs a restart); not committed.
+
+## 2026-10-30 — Spot Watch & Guard plan, Phase 3: enrollment, auto-switching, CAR_GONE
+
+Implemented, tested (285 unit tests) and live-checked on the real XVR with a throw-away RAM database;
+**not deployed, nothing enrolled in production** (the owner must run `/enroll`).
+
+**Modules:** `appearance.py` (zero-model features), `car_store.py` (SQLite, vectors only), `matcher.py`
+(policy), `autoswitch.py` (enroll / arrival / ask / undo / default-GUARD), `carfinder.py` (shared "find
+the car in this spot", also used by GUARD arming), `guard_presence.py` (is the car still there),
+CAR_GONE / departure / escalation in `guard.py`. Commands: `/enroll [rain]` (asks which spot), `/auto`
+(on; `/auto off`), inline Yes/No, undo, [Bendim]/[Ben değilim]. Manual `/watch`/`/guard` turns auto off.
+
+**Model choice (plan 5.3):** the zero-model baseline is enough, no network added. Features = HSV colour
+histogram + tone histogram + 32x20 layout thumbnail + blurred edge map (weights .2/.1/.4/.3) plus a
+box-geometry prior; stored as a 1445-float vector (checked by test: nothing image-like is stored).
+Condition (day / night-IR / rain) comes from the frame itself (IR frames are grayscale), not the clock.
+
+**Evidence (230 real crops, 24 h of both cameras, references excluded within +-2 h):**
+- ch3 (van in "ev önü"): owner 0.88-0.97 vs other cars <= 0.53 (gap +0.42), day and night.
+- ch1 (the car in "Ön (sarı ev)"): owner 0.86-0.99 vs other cars <= 0.65. Only 2 of 49 owner crops
+  were bad and both were junk detector boxes (a 40x199 sliver, two cars merged): a box-sanity rule
+  (box area 0.4-1.2x the spot polygon bbox) rejects exactly those; arrivals also use the median of 3.
+- **IR query vs daylight-only references scored ~0.70 for the owner and <= 0.49 for others.** That is
+  below t_lo, so a naive policy would silently ignore the owner at night. Fixed: with no same-condition
+  references the matcher never says "auto", and says "other" only below 0.55 (otherwise it asks).
+- Live (night): enrolling 15 samples took ~55 s per spot; fresh reads scored 0.977-0.990 (auto); the
+  other spot's car scored 0.14-0.24 (other).
+
+**Policy (conservative on purpose):** >= 0.92 auto-switch to GUARD (+ undo button), 0.75-0.92 ask
+"is this your car?" [Evet]/[Hayır] (no answer in 5 min -> GUARD with a notice, D5), < 0.75 ignore silently.
+Never auto with < 5 references for the spot; a known "not mine" sample that looks as close pulls the
+score down. Every confirmation/correction becomes a labelled sample. Acts only on a confirmed
+free->occupied flip while SPOT_WATCH is running, auto is on and alerts are not paused; the car must
+settle ~20 s and be seen in >= 2 of 3 reads, otherwise the evaluation is aborted.
+
+**CAR_GONE / departure:** the substream car-zone edge signature is compared every 5 s (no YOLO). Same car
+0.69-0.85, empty road <= 0.07 (real frames, day and night), threshold 0.30. Replaying yesterday's dusk
+(colour -> IR) gave **no false suspicions** (min similarity 0.62 ch1 / 0.70 ch3 with the 60 s reference
+refresh; 0.38 even with a fixed reference for 2.5 h). A suspicion (3 low checks, ~15 s) must then be
+confirmed by main-stream reads that ALL miss the car, so exposure shifts or a person in front cannot
+alarm. Not paused -> ALARM "ARAÇ GİTTİ" with photos from the RAM ring and [Bendim]/[Ben değilim];
+no reply in 2 min or "Ben değilim" -> repeats louder (ACİL) every 15 s. Paused (owner walking to the
+car) and absent ~90 s -> quiet departure to SPOT_WATCH; the now-free spot is not announced back to them.
+A camera that cannot be read gives no verdict and no alarm.
+
+**Bug found and fixed along the way:** Telegram albums cannot carry inline buttons, so the CAR_GONE
+buttons would have been lost on the first alert. The outbox now follows an album with a short
+"👆 Yanıtla:" message carrying the controls.
+
+**Known gaps (be honest):**
+- **Hard negatives are untested:** the same model/colour parking in the same spot. That is why t_hi is
+  high and uncertain cases ask. Real data (your confirmations over days) is needed to loosen it.
+- **Nothing is enrolled in production.** The "9 of 10 own-car arrivals" criterion cannot be measured
+  without real arrivals; only self-matching and 30 h of crops were measured. Run `/enroll` by day, at
+  night and in the rain (target >= 10 per condition) with the car parked in the spot.
+- Which car is "yours" was assumed (GUARD was armed on the ch1 spot). `/auto` only reacts to NEW arrivals;
+  a car already parked when you turn it on needs a manual `/guard`.
+- CAR_GONE and the whole arrival flow are unit-tested with fakes and checked on real frames, but no real
+  departure/arrival happened during testing, and Telegram delivery is mocked.
+- S4 (phone presence, D4) and S5 (plate OCR) are not implemented; plates are only legible on the ch1 main stream.
+- ch3 stays the weak camera for night detection (see the cross-check notes); matching there used the
+  van, which is not necessarily the owner's car.

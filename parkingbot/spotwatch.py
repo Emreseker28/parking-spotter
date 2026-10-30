@@ -38,8 +38,9 @@ log = logging.getLogger(__name__)
 
 
 class Notifier(Protocol):
-    """``ack=True`` asks for an inline "seen" button (GUARD alerts). Implementations
-    may ignore it. ``send_media_group`` is only used by GUARD evidence."""
+    """``ack=True`` asks for an inline "seen" button (GUARD alerts); ``buttons`` is rows of
+    (label, callback_data) pairs. Implementations may ignore both. ``send_media_group`` is
+    only used by GUARD evidence."""
 
     async def send_text(self, text: str, silent: bool = False, **kw) -> None: ...
     async def send_photo(self, jpeg: bytes, caption: str, **kw) -> None: ...
@@ -111,10 +112,18 @@ class Outbox:
         self.queue: deque[dict] = deque(maxlen=maxlen)
 
     async def _deliver(self, item: dict) -> None:
-        kw = {"ack": True} if item.get("ack") else {}
+        kw = {}
+        if item.get("ack"):
+            kw["ack"] = True
+        if item.get("buttons"):
+            kw["buttons"] = item["buttons"]
         if item.get("jpegs") and len(item["jpegs"]) > 1:
             try:
                 await self._n.send_media_group(item["jpegs"], item["text"])
+                if kw:
+                    # Telegram albums cannot carry inline buttons: follow up with a short
+                    # message that does (the CAR_GONE [Me]/[Not me] and the "seen" button).
+                    await self._n.send_text("👆 Yanıtla:", silent=True, **kw)
                 return
             except Exception as exc:  # noqa: BLE001 - fall back to a single photo
                 log.warning("send_media_group failed (%s); trying one photo", exc)
@@ -130,9 +139,10 @@ class Outbox:
         await self._n.send_text(item["text"], silent=item["silent"], **kw)
 
     async def send(self, text: str, jpeg: bytes | None = None, silent: bool = False,
-                   jpegs: list[bytes] | None = None, ack: bool = False) -> bool:
+                   jpegs: list[bytes] | None = None, ack: bool = False,
+                   buttons: list | None = None) -> bool:
         item = {"text": text, "jpeg": jpeg, "jpegs": jpegs, "silent": silent, "ack": ack,
-                "ts": self._clock()}
+                "buttons": buttons, "ts": self._clock()}
         try:
             await self._deliver(item)
             return True
@@ -204,6 +214,7 @@ class SpotWatch:
         self._frames: dict[int, tuple[float, object]] = {}      # channel -> (ts, frame) of the latest read
         self._cross_veto_since: dict[str, float] = {}
         self.cross_overrides = 0
+        self.on_arrival: Callable[[str], Awaitable] | None = None   # set by the bot (auto-switch)
         self._restore_trackers()
 
     # ------------------------------------------------------------ persistence
@@ -391,6 +402,13 @@ class SpotWatch:
 
         events = tr.observe(occupied, self._clock(), muted=self.controller.muted)
         self._save_tracker(tr)
+        if tr.just_arrived:
+            tr.just_arrived = False
+            if self.on_arrival is not None:
+                try:
+                    await self.on_arrival(tr.name)
+                except Exception:  # noqa: BLE001 - auto-switching must never break watching
+                    log.exception("on_arrival hook failed for %r", tr.name)
         for ev in events:
             await self._announce(r, tr, ev)
 

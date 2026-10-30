@@ -29,12 +29,12 @@ class FakeNotifier:
         self.sent: list[tuple[str, str, bool]] = []     # (kind, text, silent)
         self.fail = False
 
-    async def send_text(self, text, silent=False):
+    async def send_text(self, text, silent=False, **kw):
         if self.fail:
             raise RuntimeError("telegram down")
         self.sent.append(("text", text, silent))
 
-    async def send_photo(self, jpeg, caption):
+    async def send_photo(self, jpeg, caption, **kw):
         if self.fail:
             raise RuntimeError("telegram down")
         self.sent.append(("photo", caption, False))
@@ -495,6 +495,31 @@ class OutboxTest(unittest.TestCase):
         clock.t += 1900
         n.fail = False
         self.run_(ob.flush())
+        self.assertEqual(n.sent, [])
+
+    def test_media_group_with_buttons_gets_a_follow_up_message_carrying_them(self):
+        clock, n = Clock(), FakeNotifier()
+        groups = []
+
+        async def group(jpegs, caption, **kw):
+            groups.append((len(jpegs), caption, kw))
+        n.send_media_group = group
+        ob = Outbox(n, clock)
+        self.assertTrue(self.run_(ob.send("alarm", jpegs=[b"1", b"2", b"3"],
+                                          buttons=[[("Bendim", "cg:me")]])))
+        self.assertEqual(groups, [(3, "alarm", {})])                    # albums take no buttons
+        self.assertEqual(len(n.sent), 1)                                # the follow-up text
+        self.assertEqual(n.sent[0][0], "text")
+        self.assertTrue(n.sent[0][1].startswith("👆"))
+
+    def test_media_group_without_controls_sends_no_follow_up(self):
+        clock, n = Clock(), FakeNotifier()
+
+        async def group(jpegs, caption, **kw):
+            pass
+        n.send_media_group = group
+        ob = Outbox(n, clock)
+        self.run_(ob.send("uyarı", jpegs=[b"1", b"2"]))
         self.assertEqual(n.sent, [])
 
     def test_photo_failure_falls_back_to_text(self):

@@ -93,10 +93,10 @@ class CommandsTest(unittest.TestCase):
         self.assertIn("Kullanım", self.call(self.bot.cmd_pause, "banana")[0])
         self.assertEqual(self.bot.controller.mode, Mode.SPOT_WATCH)
 
-    def test_auto_flag_is_saved_with_phase3_note(self):
+    def test_auto_and_enroll_report_disabled_when_guard_is_off(self):
         self.bot.controller.verify()
-        self.assertIn("Faz 3", self.call(self.bot.cmd_auto)[0])
-        self.assertTrue(self.bot.controller.auto)
+        self.assertIn("kapalı", self.call(self.bot.cmd_auto)[0])
+        self.assertIn("kapalı", self.call(self.bot.cmd_enroll)[0])
 
     def test_commands_report_disabled_when_spotwatch_off(self):
         off = ParkingBot(self.settings)

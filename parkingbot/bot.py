@@ -35,7 +35,10 @@ from .feedback import (
     save_spot_crop,
 )
 from .jsonl import append_jsonl
+from .autoswitch import AutoSwitch, CB_PREFIX as AM_CB
+from .car_store import CarStore
 from .guard import GuardEngine
+from .matcher import Matcher
 from .modes import Mode, ModeController, ModeUnavailable, StateStore
 from .push_state import load_push_state, save_push_state
 from .spotwatch import SpotWatch
@@ -68,9 +71,16 @@ def restricted(func):
 
 ACK_CB = "gk:ack"
 GUARD_CB_PREFIX = "guard:arm:"
+ENROLL_CB_PREFIX = "en:"
+GONE_CB_PREFIX = "cg:"
 
 
-def _ack_markup(ack: bool):
+def _markup(ack: bool = False, buttons: list | None = None):
+    """Inline keyboard for a message: explicit rows of (label, callback_data), else the
+    "seen" button for GUARD alerts, else none."""
+    if buttons:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                     for row in buttons])
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Gördüm", callback_data=ACK_CB)]]) if ack else None
 
 
@@ -82,13 +92,15 @@ class TelegramNotifier:
         self._bot = bot
         self._chat_id = chat_id
 
-    async def send_text(self, text: str, silent: bool = False, ack: bool = False) -> None:
+    async def send_text(self, text: str, silent: bool = False, ack: bool = False,
+                        buttons: list | None = None) -> None:
         await self._bot.send_message(chat_id=self._chat_id, text=text,
-                                     disable_notification=silent, reply_markup=_ack_markup(ack))
+                                     disable_notification=silent, reply_markup=_markup(ack, buttons))
 
-    async def send_photo(self, jpeg: bytes, caption: str, ack: bool = False) -> None:
+    async def send_photo(self, jpeg: bytes, caption: str, ack: bool = False,
+                         buttons: list | None = None) -> None:
         await self._bot.send_photo(chat_id=self._chat_id, photo=jpeg, caption=caption,
-                                   reply_markup=_ack_markup(ack))
+                                   reply_markup=_markup(ack, buttons))
 
     async def send_media_group(self, jpegs: list[bytes], caption: str) -> None:
         media = [InputMediaPhoto(j, caption=caption if i == 0 else None) for i, j in enumerate(jpegs[:10])]
@@ -173,6 +185,7 @@ class ParkingBot:
         # Spot Watch (set up in init_spotwatch once the Telegram bot exists).
         self.spotwatch: SpotWatch | None = None
         self.guard: GuardEngine | None = None
+        self.auto: AutoSwitch | None = None
         self.controller: ModeController | None = None
         self._sw_job = None
 
@@ -193,6 +206,11 @@ class ParkingBot:
             self.guard = GuardEngine(self.settings, self.controller, self.capture, self.detector,
                                      self.spotwatch.outbox, tz=tz)
             self.controller.guard_available = True
+            self.guard.on_departure = self._on_departure
+            self.auto = AutoSwitch(self.settings, self.controller, Matcher(CarStore(store.db), None),
+                                   self.detector, self.capture, self.guard, self.spotwatch.outbox)
+            self.auto.matcher.cfg = self.auto.cfg.match
+            self.spotwatch.on_arrival = self.auto.on_arrival
         log.info("Spot Watch enabled: every %.0fs, state db %s, guard=%s",
                  self.spotwatch.cfg.interval, db, self.guard is not None)
 
@@ -407,7 +425,7 @@ class ParkingBot:
             return
         ok, msg = await self.guard.arm(idx)
         if ok:
-            self.controller.set_manual(Mode.GUARD, name)
+            self.controller.auto_enter_guard(name)       # keeps the persisted auto flag
             await self.spotwatch.outbox.send(f"🛡️ Yeniden başlatma sonrası GUARD devam ediyor. {msg}", silent=True)
         else:
             await self.spotwatch.outbox.send(
@@ -471,7 +489,7 @@ class ParkingBot:
     @restricted
     async def cmd_ack(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.guard is None:
-            await self._sw_reply(update, "")
+            await update.effective_message.reply_text("GUARD kapalı (config: guard.enabled).")
             return
         msg = "✅ Alarm onaylandı, tekrar durdu." if self.guard.ack() else "Onaylanacak alarm yok."
         await update.effective_message.reply_text(msg)
@@ -487,10 +505,95 @@ class ParkingBot:
         if self.spotwatch is None:
             await self._sw_reply(update, "")
             return
+        if self.auto is None:
+            await update.effective_message.reply_text("Otomatik mod kapalı (config: guard.enabled).")
+            return
+        if context.args and context.args[0].lower() in ("off", "kapat", "kapalı"):
+            self.controller.set_auto(False)
+            await update.effective_message.reply_text("🔁 Otomatik mod kapatıldı. Geçişleri elle yaparsın (/watch, /guard).")
+            return
         self.controller.set_auto(True)
+        have = sum(c["pos"] for sp in self.settings.spots
+                   for c in self.auto.matcher.store.counts(sp.name).values())
+        warn = "" if have else "\n⚠️ Henüz referans yok: önce arabanın park yerindeyken /enroll çalıştır; o zamana kadar her yeni araç için sorarım."
         await update.effective_message.reply_text(
-            "🔁 Otomatik mod işaretlendi, ancak otomatik geçiş (arabanı tanıma) "
-            "Faz 3'te geliyor; şimdilik SPOT_WATCH sabit.")
+            "🔁 Otomatik mod AÇIK. Yeni araç park edince arabanı tanırsam GUARD'a geçerim, emin olamazsam "
+            f"sorarım (5 dk cevap yoksa GUARD). Elle /watch veya /guard dersen otomatik mod kapanır.{warn}")
+
+    @restricted
+    async def cmd_enroll(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.auto is None:
+            await update.effective_message.reply_text("Araç tanıtma kapalı (config: guard.enabled).")
+            return
+        rain = bool(context.args and context.args[0].lower() in ("rain", "yağmur", "yagmur"))
+        buttons = [[InlineKeyboardButton(sp.name, callback_data=f"{ENROLL_CB_PREFIX}{i}:{int(rain)}")]
+                   for i, sp in enumerate(self.settings.spots)]
+        await update.effective_message.reply_text(
+            f"📸 Araban hangi park yerinde? ({'yağmurlu hava' if rain else 'koşul görüntüden otomatik anlaşılır: gündüz/gece'})\n"
+            "Seçince ~1 dk içinde 15 örnek alırım; yalnızca sayısal vektör saklanır, görüntü saklanmaz.",
+            reply_markup=InlineKeyboardMarkup(buttons))
+
+    @restricted
+    async def on_enroll_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        try:
+            idx_s, rain_s = (query.data or "")[len(ENROLL_CB_PREFIX):].split(":")
+            idx, rain = int(idx_s), rain_s == "1"
+            spot = self.settings.spots[idx]
+        except (ValueError, IndexError):
+            return
+        if self.auto is None:
+            return
+        await query.message.edit_text(f"⏳ {spot.name}: örnekler alınıyor (~1 dk)… Araç bu yerde durmalı.")
+        ok, msg = await self.auto.enroll(idx, rain)
+        await query.message.edit_text(msg if ok else f"⚠️ {msg}")
+
+    @restricted
+    async def on_auto_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        try:
+            _, verb, pid = (query.data or "").split(":", 2)
+        except ValueError:
+            return
+        if self.auto is None or verb not in ("yes", "no"):
+            return
+        msg = await self.auto.answer(pid, verb == "yes")
+        try:
+            await query.message.edit_text(f"{query.message.text}\n\n{msg}")
+        except Exception:  # noqa: BLE001 - editing is cosmetic
+            await query.message.reply_text(msg)
+
+    async def _on_departure(self, reason: str) -> None:
+        """The owner's car left (they said so, or they were paused for ~90 s): leave GUARD,
+        return to SPOT_WATCH without announcing the now-free spot back to them."""
+        name = self.controller.guard_spot or (self.guard.spot.name if self.guard and self.guard.spot else None)
+        await self.guard.disarm("departure")
+        if name and name in self.spotwatch.trackers:
+            self.spotwatch.trackers[name].quiet_next_free = True
+        self.controller.auto_enter_watch()
+        self.spotwatch.kick()
+        self._schedule_spotwatch(0.5)
+        text = ("👋 İyi yolculuklar! SPOT_WATCH'a döndüm." if reason == "owner" else
+                "🚗 Araç ayrıldı (duraklatılmışken ~90 sn yerinde yok). SPOT_WATCH'a döndüm; yer boşalınca haber veririm.")
+        await self.spotwatch.outbox.send(text, silent=True)
+
+    @restricted
+    async def on_gone_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        verb = (query.data or "")[len(GONE_CB_PREFIX):]
+        if self.guard is None:
+            await query.answer()
+            return
+        if verb == "me":
+            done = await self.guard.owner_departure()
+            await query.answer("Tamam, SPOT_WATCH'a dönüyorum." if done else "GUARD aktif değil.")
+        elif verb == "notme":
+            done = self.guard.escalate()
+            await query.answer("Alarm sürüyor, daha sık tekrarlanacak." if done else "Aktif alarm yok.", show_alert=True)
+        else:
+            await query.answer()
 
     @restricted
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,6 +629,8 @@ class ParkingBot:
         text = self.spotwatch.status_text()
         if self.guard is not None:
             text += "\n\n" + self.guard.status_text()
+        if self.auto is not None:
+            text += "\n\n" + self.auto.status_text()
         await update.effective_message.reply_text(text)
 
     @restricted
@@ -845,7 +950,8 @@ BOT_COMMANDS = [
     ("watch", "Park yeri izleme modu"),
     ("guard", "Araba koruma modu"),
     ("ack", "Alarmı onayla"),
-    ("auto", "Otomatik mod geçişi"),
+    ("auto", "Otomatik mod (arabanı tanıyıp GUARD'a geç)"),
+    ("enroll", "Arabanı tanıt (referans örnekleri)"),
     ("pause", "Bildirimleri duraklat, örn. /pause 10m"),
     ("resume", "Duraklatmayı bitir"),
     ("status", "Mod ve sağlık durumu"),
@@ -891,6 +997,10 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("resume", bot.cmd_resume))
     app.add_handler(CommandHandler("status", bot.cmd_status))
     app.add_handler(CommandHandler("ack", bot.cmd_ack))
+    app.add_handler(CommandHandler("enroll", bot.cmd_enroll))
+    app.add_handler(CallbackQueryHandler(bot.on_enroll_button, pattern=f"^{ENROLL_CB_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(bot.on_auto_button, pattern=f"^{AM_CB}"))
+    app.add_handler(CallbackQueryHandler(bot.on_gone_button, pattern=f"^{GONE_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(bot.on_guard_button, pattern=f"^{GUARD_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(bot.on_ack_button, pattern=f"^{ACK_CB}$"))
     app.add_handler(CallbackQueryHandler(bot.on_camera_button, pattern=f"^{CAM_CB_PREFIX}"))

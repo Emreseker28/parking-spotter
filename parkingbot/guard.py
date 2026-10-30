@@ -26,11 +26,13 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from .carfinder import find_car
 from .config import ROOT, Settings, Spot
 from .guard_detector import GuardDetector
 from .guard_gate import MotionGate, XvrEventGate
-from .guard_geometry import Box, Zones, area, build_zones, inter_area, iou
+from .guard_geometry import Box, Zones, build_zones, iou
 from .guard_limiter import DutyLimiter
+from .guard_presence import PresenceMonitor
 from .guard_rules import ALERT, INFO, WARNING, GuardEvent, RuleConfig, RulesEngine
 from .guard_tracker import Det, Tracker
 from .modes import Mode, ModeController
@@ -93,6 +95,16 @@ class GuardConfig:
     night_margin_min: float = 30.0
     night_start_hour: int = 19
     night_end_hour: int = 6
+    presence_check_s: float = 5.0        # car-still-there check cadence (substream, no YOLO)
+    gone_sim: float = 0.30               # zone similarity below this = suspicious
+    gone_checks: int = 3                 # consecutive low checks (~15 s) before confirming
+    gone_confirm_reads: int = 2          # main-stream reads that must ALL miss the car
+    gone_confirm_gap_s: float = 3.0
+    gone_recheck_s: float = 15.0
+    departure_s: float = 90.0            # paused + absent this long = the owner drove off
+    gone_reply_s: float = 120.0          # no [Me]/[Not me] reply -> repeat louder
+    gone_repeat_escalated_s: float = 15.0
+    gone_repeat_max: int = 60
     perimeters: dict = field(default_factory=dict)   # spot name -> polygon (main-stream px)
     rules: RuleConfig = field(default_factory=RuleConfig)
 
@@ -138,6 +150,16 @@ class GuardConfig:
             night_margin_min=float(n.get("margin_minutes", d.night_margin_min)),
             night_start_hour=int(n.get("start_hour", d.night_start_hour)),
             night_end_hour=int(n.get("end_hour", d.night_end_hour)),
+            presence_check_s=float(c.get("presence_check_seconds", d.presence_check_s)),
+            gone_sim=float(c.get("gone_similarity", d.gone_sim)),
+            gone_checks=int(c.get("gone_checks", d.gone_checks)),
+            gone_confirm_reads=int(c.get("gone_confirm_reads", d.gone_confirm_reads)),
+            gone_confirm_gap_s=float(c.get("gone_confirm_gap_seconds", d.gone_confirm_gap_s)),
+            gone_recheck_s=float(c.get("gone_recheck_seconds", d.gone_recheck_s)),
+            departure_s=float(c.get("departure_seconds", d.departure_s)),
+            gone_reply_s=float(c.get("gone_reply_seconds", d.gone_reply_s)),
+            gone_repeat_escalated_s=float(c.get("gone_repeat_escalated_seconds", d.gone_repeat_escalated_s)),
+            gone_repeat_max=int(c.get("gone_repeat_max", d.gone_repeat_max)),
             perimeters=dict(c.get("perimeters", {}) or {}),
             rules=RuleConfig(
                 loiter_s=float(r.get("loiter_seconds", 10)),
@@ -155,6 +177,10 @@ class ActiveAlert:
     last_sent: float
     repeats: int = 0
     acked: bool = False
+    buttons: list | None = None          # e.g. CAR_GONE [Me] / [Not me]
+    kind: str = "alert"                  # "alert" | "gone"
+    started: float = 0.0
+    escalated: bool = False              # CAR_GONE unanswered / "not me": repeat louder
 
 
 class GuardEngine:
@@ -185,6 +211,11 @@ class GuardEngine:
         self.rules = RulesEngine(self.cfg.rules)
         self.evidence: deque[tuple[float, np.ndarray]] = deque()
         self._tasks: list[asyncio.Task] = []
+        self.presence: PresenceMonitor | None = None
+        self.on_departure: Callable[[str], object] | None = None   # set by the bot
+        self._gone_task: asyncio.Task | None = None
+        self.gone_state: str | None = None        # None | "suspect" | "gone"
+        self.gone_alerted = False
         self._slot: tuple[float, np.ndarray] | None = None
         self._evt = asyncio.Event()
         self._reset_stats()
@@ -208,25 +239,8 @@ class GuardEngine:
 
     # --------------------------------------------------------------- arming
     def _pick_car(self, jpeg: bytes, spot: Spot) -> Box | None:
-        """Owner's car box (main-stream px) for one arming read. Plain YOLOv8n misses
-        some night/top-down cars (ch3), so fall back to the tier-2 detector."""
-        img = self.detector.decode(jpeg)
-        full = self.detector.detect_array(img)
-        r = self.detector.check_spot(img, spot, full)
-        dets = list(r.detections) if r.occupied else []
-        if not dets:
-            t2 = self.detector.check_spot_tier2(img, spot)
-            if t2 is not None and t2.occupied:
-                dets = list(t2.detections)
-        if not dets:
-            return None
-        xs = [p[0] for p in spot.polygon]
-        ys = [p[1] for p in spot.polygon]
-        pb = (min(xs), min(ys), max(xs), max(ys))
-        best = max(dets, key=lambda d: inter_area(d.box, pb))
-        if inter_area(best.box, pb) < 0.5 * area(best.box):
-            return None                      # the best box is mostly outside the spot
-        return tuple(float(v) for v in best.box)
+        """Owner's car box (main-stream px) for one arming read."""
+        return find_car(self.detector, self.detector.decode(jpeg), spot)
 
     async def arm(self, spot_idx: int) -> tuple[bool, str]:
         """Find the owner's car in the chosen spot (median of ~5 reads), build the
@@ -284,6 +298,9 @@ class GuardEngine:
         if self.cfg.gate in ("xvr", "both"):
             self.xvr = XvrEventGate(sec.nvr_ip, sec.rtsp_user, sec.rtsp_pass, spot.channel,
                                     clock=self._clock, codes=self.cfg.xvr_codes)
+        self.presence = PresenceMonitor(self.zones.car, self.cfg.presence_check_s, self.cfg.gone_sim,
+                                        self.cfg.gone_checks)
+        self.gone_state, self.gone_alerted, self._gone_task = None, False, None
         self.armed = True
 
     def _start(self, spot: Spot) -> None:
@@ -299,6 +316,9 @@ class GuardEngine:
         if not self.armed and not self._tasks:
             return
         self.armed = False
+        if self._gone_task is not None:
+            self._tasks.append(self._gone_task)
+            self._gone_task = None
         for t in self._tasks:
             t.cancel()
         for t in self._tasks:
@@ -312,6 +332,7 @@ class GuardEngine:
         self.rules.reset()
         self._slot = None
         self.active_alert = None
+        self.gone_state, self.gone_alerted = None, False
         log.info("guard disarmed (%s)", reason)
 
     # ----------------------------------------------------------------- source
@@ -387,6 +408,11 @@ class GuardEngine:
                 self.global_rejects += 1
             if g.motion:
                 self.last_motion_ts = ts
+        if self.presence is not None and self.presence.update(frame, ts) and self._gone_task is None:
+            try:
+                self._gone_task = asyncio.get_running_loop().create_task(self._gone_flow(), name="guard-gone")
+            except RuntimeError:         # no running loop (unit tests feeding frames directly)
+                pass
         if self._slot is not None:
             self.dropped += 1            # the detector never got to the previous frame
         self._slot = (ts, frame)
@@ -509,6 +535,117 @@ class GuardEngine:
             if with_ack:
                 await self.outbox.send("Görüldü olarak işaretlemek için /ack", silent=True, ack=True)
 
+    # ------------------------------------------------------- CAR_GONE / departure
+    async def _main_sees_car(self) -> bool | None:
+        """Confirm with main-stream reads: True if any read finds the car, False if every
+        read misses it, None if the camera could not be read at all."""
+        got_any = False
+        for i in range(self.cfg.gone_confirm_reads):
+            try:
+                jpeg = await self.capture.grab(self.spot.channel, 0, expected_size=self.spot.frame_size)
+                box = await asyncio.to_thread(self._pick_car, jpeg, self.spot)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("gone confirm read failed: %s", exc)
+                box = None
+            else:
+                got_any = True
+            if box is not None:
+                return True
+            if i < self.cfg.gone_confirm_reads - 1:
+                await asyncio.sleep(self.cfg.gone_confirm_gap_s)
+        return False if got_any else None
+
+    async def _gone_flow(self) -> None:
+        """The substream says the car zone changed. Confirm on the main stream; then either
+        treat a paused owner's absence as a departure, or raise CAR_GONE."""
+        try:
+            self.gone_state = "suspect"
+            absent_since = None
+            while self.armed:
+                seen = await self._main_sees_car()
+                if seen:
+                    log.info("guard: car is still there (false alarm: sim=%.2f); reference refreshed",
+                             self.presence.sim or 0.0)
+                    if self.slot_frame() is not None:
+                        self.presence.reseed(self.slot_frame(), self._clock())
+                    if self.gone_alerted:
+                        await self.outbox.send(f"ℹ️ {SEV_STYLE[INFO][1]} · {self.spot.name}: araç yerine döndü.", silent=True)
+                        self.active_alert = None
+                    self.gone_state, self.gone_alerted = None, False
+                    return
+                if seen is None:                     # cannot see the camera: no verdict, no alarm
+                    await asyncio.sleep(self.cfg.gone_recheck_s)
+                    continue
+                now = self._clock()
+                absent_since = absent_since or now
+                self.gone_state = "gone"
+                if self.controller.muted:            # owner paused before leaving: quiet departure
+                    if now - absent_since >= self.cfg.departure_s:
+                        self._depart("pause")
+                        return
+                elif not self.gone_alerted:
+                    await self._raise_car_gone(absent_since)
+                await asyncio.sleep(self.cfg.gone_recheck_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("guard gone-flow crashed")
+        finally:
+            self._gone_task = None
+            if self.gone_state == "suspect":
+                self.gone_state = None
+
+    def slot_frame(self):
+        return self.evidence[-1][1] if self.evidence else None
+
+    def _depart(self, reason: str) -> None:
+        """Hand over to the bot (separate task: the bot disarms us, which cancels tasks)."""
+        self.gone_state = None
+        cb = self.on_departure
+        if cb is not None:
+            asyncio.get_running_loop().create_task(cb(reason))
+
+    async def _raise_car_gone(self, absent_since: float) -> None:
+        now = self._clock()
+        self.gone_alerted = True
+        self.alerts[ALERT] += 1
+        text = (f"{SEV_STYLE[ALERT][0]} {SEV_STYLE[ALERT][1]} · ARAÇ GİTTİ\n{self.spot.name}: araç yerinde değil! "
+                f"Sen aldıysan \"Bendim\" de.")
+        buttons = [[("Bendim", "cg:me"), ("Ben değilim", "cg:notme")]]
+        frame = self.slot_frame()
+        jpegs = []
+        if frame is not None:
+            img = frame.copy()
+            z = self.zones.car
+            cv2.rectangle(img, (int(z[0]), int(z[1])), (int(z[2]), int(z[3])), (0, 0, 255), 2)
+            ts0 = self.evidence[-1][0]
+            earlier = [f for t, f in self.evidence if t < ts0 - 4.0]
+            for im in [img] + ([earlier[0], earlier[len(earlier) // 2]] if len(earlier) >= 2 else []):
+                ok, buf = cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, self.cfg.jpeg_quality])
+                if ok:
+                    jpegs.append(buf.tobytes())
+        await self.outbox.send(text, jpegs=jpegs or None, buttons=buttons)
+        self.latencies.append(self._clock() - now)
+        self.active_alert = ActiveAlert(text, self._clock(), buttons=buttons, kind="gone", started=now)
+        log.info("guard alert ALERT CAR_GONE spot=%r absent for %.0fs", self.spot.name, now - absent_since)
+
+    async def owner_departure(self) -> bool:
+        """[Me] / the owner drove off: stop alarming and hand over to SPOT_WATCH."""
+        if not self.armed:
+            return False
+        self.active_alert = None
+        self._depart("owner")
+        return True
+
+    def escalate(self) -> bool:
+        """[Not me]: repeat louder right away."""
+        a = self.active_alert
+        if a is None or a.kind != "gone":
+            return False
+        a.escalated = True
+        a.last_sent = 0.0
+        return True
+
     def ack(self) -> bool:
         """/ack: stop an ALERT from repeating. True if there was one."""
         a = self.active_alert
@@ -519,22 +656,29 @@ class GuardEngine:
         return True
 
     async def _repeat_loop(self) -> None:
-        """ALERT repeats every ``alert_repeat_s`` until /ack (D7), capped."""
+        """ALERT repeats every ``alert_repeat_s`` until /ack (D7), capped. An unanswered
+        CAR_GONE (no [Me]/[Not me] within ``gone_reply_s``) repeats louder and faster."""
         while True:
             await asyncio.sleep(1.0)
             a = self.active_alert
             if a is None or a.acked or self.controller.muted:
                 continue
-            if self._clock() - a.last_sent < self.cfg.alert_repeat_s:
+            now = self._clock()
+            if a.kind == "gone" and not a.escalated and now - a.started >= self.cfg.gone_reply_s:
+                a.escalated = True
+            every = self.cfg.gone_repeat_escalated_s if a.escalated else self.cfg.alert_repeat_s
+            if now - a.last_sent < every:
                 continue
-            if a.repeats >= self.cfg.alert_repeat_max:
+            cap = self.cfg.gone_repeat_max if a.kind == "gone" else self.cfg.alert_repeat_max
+            if a.repeats >= cap:
                 self.active_alert = None
-                await self.outbox.send("ℹ️ BİLGİ · Alarm tekrarı durduruldu (onaylanmadı). /status",
-                                       silent=True)
+                await self.outbox.send("ℹ️ BİLGİ · Alarm tekrarı durduruldu (onaylanmadı). /status", silent=True)
                 continue
             a.repeats += 1
-            a.last_sent = self._clock()
-            await self.outbox.send(f"{a.text}\n(tekrar {a.repeats}/{self.cfg.alert_repeat_max})", ack=True)
+            a.last_sent = now
+            head = "‼️ ACİL — " if a.escalated else ""
+            await self.outbox.send(f"{head}{a.text}\n(tekrar {a.repeats}/{cap})", ack=a.buttons is None,
+                                   buttons=a.buttons)
 
     # ----------------------------------------------------------------- status
     def status_text(self) -> str:
@@ -558,6 +702,10 @@ class GuardEngine:
             f"Uyarılar: bilgi {self.alerts[INFO]}, uyarı {self.alerts[WARNING]}, alarm {self.alerts[ALERT]}"
             f"{', bastırılan ' + str(self.suppressed) if self.suppressed else ''}",
         ]
+        if self.presence is not None and self.presence.sim is not None:
+            lines.append(f"Araç yerinde mi: benzerlik {self.presence.sim:.2f}"
+                         f"{' — ŞÜPHELİ' if self.gone_state else ''}"
+                         f"{' (ARAÇ GİTTİ alarmı aktif)' if self.gone_alerted else ''}")
         if self.active_alert and not self.active_alert.acked:
             lines.append("⚠️ Onaylanmamış alarm var → /ack")
         return "\n".join(lines)

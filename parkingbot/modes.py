@@ -72,6 +72,11 @@ class StateStore:
         )
         self._db.commit()
 
+    @property
+    def db(self) -> sqlite3.Connection:
+        """Raw connection for modules that keep their own tables (car references)."""
+        return self._db
+
     def close(self) -> None:
         self._db.close()
 
@@ -181,6 +186,23 @@ class ModeController:
         self.paused_until = None
         self.resume_guard = None
         self._enter(mode)
+
+    def auto_enter_guard(self, spot_name: str) -> None:
+        """Automatic switch to GUARD (arrival matched / owner confirmed). Unlike
+        ``set_manual`` this keeps ``auto`` on: automatic mode stays automatic."""
+        if not self.guard_available:
+            raise ModeUnavailable("GUARD is not available")
+        self.guard_spot = spot_name
+        self.paused_until = None
+        self.resume_guard = None
+        self._enter(Mode.GUARD)
+
+    def auto_enter_watch(self) -> None:
+        """Automatic switch back to SPOT_WATCH (departure); keeps ``auto`` on."""
+        self.guard_spot = None
+        self.paused_until = None
+        self.resume_guard = None
+        self._enter(Mode.SPOT_WATCH)
 
     def set_auto(self, on: bool) -> None:
         self.auto = on
