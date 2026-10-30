@@ -37,6 +37,9 @@ class Spot:
     channel: int
     polygon: list[tuple[int, int]]
     frame_size: tuple[int, int] | None = None  # (width, height) of the mainstream frame
+    # Optional second camera that also sees this spot (e.g. ch3 sees both spots). Used
+    # only as a veto on a "free" verdict: another camera still seeing a car blocks the alert.
+    cross: "Spot | None" = None
 
 
 @dataclass(frozen=True)
@@ -129,9 +132,18 @@ def _parse_spots(raw: dict) -> list[Spot]:
             )
         fs = entry.get("frame_size")
         frame_size = (int(fs[0]), int(fs[1])) if fs else None
+        cross = None
+        cc = entry.get("cross_check")
+        if cc:
+            cpoly = [(int(x), int(y)) for x, y in cc["polygon"]]
+            if len(cpoly) < 3:
+                raise ConfigError(f"Spot {entry.get('name')!r} cross_check polygon needs >=3 points.")
+            cfs = cc.get("frame_size")
+            cross = Spot(name=f"{entry['name']} (ch{int(cc['channel'])})", channel=int(cc["channel"]),
+                         polygon=cpoly, frame_size=(int(cfs[0]), int(cfs[1])) if cfs else None)
         spots.append(
             Spot(name=str(entry["name"]), channel=int(entry["channel"]),
-                   polygon=poly, frame_size=frame_size)
+                   polygon=poly, frame_size=frame_size, cross=cross)
         )
     if not spots:
         raise ConfigError("config.yaml defines no parking spots.")

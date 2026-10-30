@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 from parkingbot.capture import CaptureError
-from parkingbot.config import load_settings
+from parkingbot.config import Spot, load_settings
 from parkingbot.modes import Mode, ModeController, StateStore
 from parkingbot.spotwatch import Outbox, SpotWatch, WatchConfig
 from parkingbot.verifier import VerifyResult
@@ -50,12 +51,14 @@ class FakeCamera:
         self.occupied = {s.name: True for s in settings.spots}
         self.fail_channels: set[int] = set()
         self.reads: list[int] = []
+        self.with_frames = False
 
     async def __call__(self, ch):
         self.reads.append(ch)
         if ch in self.fail_channels:
             raise CaptureError("ffmpeg timed out")
-        return [SimpleNamespace(spot=s, occupied=self.occupied[s.name], coverage=0.0, frame=None)
+        frame = object() if self.with_frames else None
+        return [SimpleNamespace(spot=s, occupied=self.occupied[s.name], coverage=0.0, frame=frame)
                 for s in self.settings.spots if s.channel == ch]
 
 
@@ -74,8 +77,27 @@ class FakeDetector:
         self.t2_occupied = False
         self.t2_calls = 0
 
+    cross_occupied = False
+    cross_t2 = False
+
+    def decode(self, jpeg):
+        return object()
+
+    def detect_array(self, frame):
+        return []
+
+    def check_spot(self, frame, spot, full):
+        return SimpleNamespace(occupied=self.cross_occupied, coverage=0.5)
+
+    whole_boxes: list = []
+
     def check_spot_tier2(self, frame, spot):
         self.t2_calls += 1
+        if spot.name == "whole":                           # tier-2 over the whole cross frame
+            return SimpleNamespace(occupied=False, coverage=0.0,
+                                   detections=[SimpleNamespace(box=b) for b in self.whole_boxes])
+        if spot.name.endswith("(ch3)"):                    # the cross-check view
+            return SimpleNamespace(occupied=self.cross_t2, coverage=0.7)
         return SimpleNamespace(occupied=self.t2_occupied, coverage=0.8)
 
 
@@ -341,6 +363,103 @@ class SpotWatchTest(unittest.TestCase):
         txt = h.sw.status_text()
         for needle in ("SPOT_WATCH", self.a, self.b, "RTSP", "CPU"):
             self.assertIn(needle, txt)
+
+
+class CrossCheckTest(unittest.TestCase):
+    """A second camera that also sees a spot may veto a 'free' verdict, never create one."""
+
+    def setUp(self):
+        self.h = Harness()
+        h = self.h
+        self.a, self.b = [sp.name for sp in h.settings.spots]
+        base = h.settings.spots[0]
+        h.settings.spots[0] = dataclasses.replace(
+            base, cross=Spot(f"{base.name} (ch3)", 3, [(590, 300), (790, 300), (790, 415), (590, 415)], (960, 576)))
+        h.cam.with_frames = True
+        h.build()
+        h.cycle()                                           # baseline: both occupied
+
+    def tearDown(self):
+        self.h.close()
+
+    def free_a(self):
+        self.h.cam.occupied[self.a] = False
+
+    def test_other_camera_still_sees_a_car_vetoes_the_alert(self):
+        h = self.h
+        self.free_a(); h.det.cross_occupied = True
+        h.cycle(60); h.cycle(10); h.cycle(60)
+        self.assertEqual(h.notifier.sent, [])
+        self.assertGreaterEqual(h.sw.cross_overrides, 1)
+        self.assertEqual(h.sw.trackers[self.a].confirmed, "occupied")
+
+    def test_cross_tier2_second_opinion_also_vetoes(self):
+        h = self.h
+        self.free_a(); h.det.cross_occupied = False; h.det.cross_t2 = True
+        h.cycle(60); h.cycle(10)
+        self.assertEqual(h.notifier.sent, [])
+
+    def test_both_cameras_agree_free_alerts_normally(self):
+        h = self.h
+        self.free_a(); h.det.cross_occupied = False; h.det.cross_t2 = False
+        h.cycle(60); h.cycle(10)
+        self.assertEqual(len(h.notifier.sent), 1)
+        self.assertIn(self.a, h.notifier.texts()[0])
+
+    def test_unavailable_second_camera_gives_no_veto(self):
+        h = self.h
+        self.free_a(); h.det.cross_occupied = True
+        h.cam.fail_channels = {3}                           # ch3 down: no frame, capture is None
+        h.sw._frames.clear()
+        h.cycle(60); h.cycle(10)
+        self.assertEqual(len(h.notifier.sent), 1)           # not blocked by a camera we cannot see
+
+    def test_persistent_disagreement_stops_vetoing_after_the_limit(self):
+        h = self.h
+        self.free_a(); h.det.cross_occupied = True
+        for _ in range(25):                                 # ~25 min of ch1 free vs ch3 occupied
+            h.cycle(60); h.cycle(10)
+        self.assertTrue(any(self.a in t and "BOŞ" in t for t in h.notifier.texts()))
+
+    def test_not_consulted_without_a_cross_view_or_when_already_free(self):
+        h = self.h
+        h.cam.occupied[self.b] = False                      # ev önü has no cross view
+        calls = []
+        orig = h.sw._cross_sees_car
+
+        async def spy(spot, tr):
+            calls.append(spot.name)
+            return await orig(spot, tr)
+        h.sw._cross_sees_car = spy
+        h.cycle(60); h.cycle(10)
+        self.assertNotIn(self.b, calls)
+        self.free_a(); h.det.cross_occupied = False
+        h.cycle(60); h.cycle(10)                            # a confirmed free
+        n = len(calls)
+        h.cycle(60)
+        self.assertEqual(len(calls), n)                     # steady free state: not re-checked
+
+    def test_whole_frame_tier2_finds_the_night_car_the_crops_miss(self):
+        h = self.h
+        cs = h.settings.spots[0].cross
+        h.det.cross_occupied = False; h.det.cross_t2 = False
+        h.det.whole_boxes = [(585, 295, 790, 418)]          # car 2, full box
+        self.assertTrue(h.sw._cross_occupied(object(), cs))
+        h.det.whole_boxes = [(800, 345, 890, 415)]          # only the neighbour (car 3)
+        self.assertFalse(h.sw._cross_occupied(object(), cs))
+        h.det.whole_boxes = [(100, 130, 440, 370)]          # the van = the other spot
+        self.assertFalse(h.sw._cross_occupied(object(), cs))
+        h.det.whole_boxes = []
+
+    def test_cross_occupied_uses_detector_then_tier2(self):
+        h = self.h
+        cs = h.settings.spots[0].cross
+        h.det.cross_occupied = False; h.det.cross_t2 = False
+        self.assertFalse(h.sw._cross_occupied(object(), cs))
+        h.det.cross_t2 = True
+        self.assertTrue(h.sw._cross_occupied(object(), cs))
+        h.det.cross_occupied = True; h.det.cross_t2 = False
+        self.assertTrue(h.sw._cross_occupied(object(), cs))
 
 
 class OutboxTest(unittest.TestCase):

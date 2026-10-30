@@ -485,3 +485,28 @@ Fixed with `-fps_mode passthrough` (same quirk as the Phase 0 playback probe).
 - Jellyfin-contention test not done (needs a real transcode running). 48 h soak is Phase 4.
 - Until Phase 3 (`CAR_GONE`) GUARD does not notice if the car drives away; use `/watch`.
 - Evidence is 352x288 (substream); the main-stream follow-up photo is what a human can judge.
+
+## 2026-10-30 — Cross-camera check for "Ön (sarı ev)" (owner: ch3 sees both spots)
+
+Owner input: ch3 contains BOTH spots ("ev önü" and "Ön (sarı ev)", the latter = the nearer of the two
+cars on the right of ch3), and ch3 is the ONLY camera that sees "ev önü" (so a ch3 outage blinds it
+with no fallback; the bot already reports "durumu bilinmiyor").
+
+**Built:** optional `cross_check` per spot (`Spot.cross`). SPOT_WATCH consults it only when the
+primary reading says free and the spot was confirmed occupied: if the other camera still sees a car
+the free reading is vetoed (`cross_override`). It can only suppress, never create, an alert; an
+unavailable second camera means no opinion; a disagreement lasting `cross_max_veto_minutes` (10)
+stops vetoing so a wrong mapping can delay an alert but never swallow it.
+
+**Evidence (30 h of XVR recordings, 40 samples, both cameras):**
+- ch1's spot was occupied 40/40 (the same car never left; plain YOLO never missed it, even at night).
+- ch3 "car 2" region: crop-based detection finds it by day and misses it at night (15/40); a tier-2 pass
+  over the WHOLE frame finds it at night and misses it by day (18/40); neither alone is reliable on
+  ch3. The cross-view therefore ORs three opinions (detector, tier-2 crop, tier-2 whole frame).
+- "car 3" (far right) was empty 38/40: it is not the ch1 car, consistent with the owner's mapping.
+  The history cannot PROVE the mapping because ch1 never freed; it is consistent with it.
+- Live method check: car 2 and car 3 read as cars, two clearly empty regions read as empty.
+
+**Honest value:** small. ch1 is already reliable at night, and ch3's view of that car is flaky, so this
+mostly guards against a rare ch1 false-free. It costs ~1 s CPU only on a free reading. Tests: 224/224
+(8 new). Not deployed (needs a restart); not committed.

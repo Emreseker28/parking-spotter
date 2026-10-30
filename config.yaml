@@ -52,6 +52,13 @@ spots:
     channel: 1
     frame_size: [960, 1080]  # expected mainstream size (informational)
     polygon: [[285, 425], [510, 435], [505, 815], [295, 805]]
+    # ch3 also sees this spot (the nearer of the two cars on the right). Used by SPOT_WATCH
+    # only as a veto: if ch1 says free but ch3 still sees a car, the alert is held.
+    # ch3 is NOT reliable alone (30 h replay: finds the car 15-18/40 times), hence a veto.
+    cross_check:
+      channel: 3
+      frame_size: [960, 576]
+      polygon: [[590, 300], [790, 300], [790, 415], [590, 415]]
 
   - name: "ev önü"          # Spot B — ch3, large dark car (top-down)
     channel: 3
@@ -166,6 +173,7 @@ spotwatch:
   backoff_max_seconds: 480
   state_db: "state/spotter.db"  # SQLite: mode, settings, tracker state (never images)
   state_max_age_hours: 12       # restore tracker state on restart only if this fresh
+  cross_max_veto_minutes: 10    # if ch1 and ch3 disagree this long, stop vetoing and alert
   timezone: "Europe/Istanbul"   # camera clock is UTC+3; also used for "night"
 
 # GUARD mode: watch the owner's parked car for suspicious activity (Phase 2).

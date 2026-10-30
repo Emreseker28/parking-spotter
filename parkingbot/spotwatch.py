@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from .capture import CaptureError
-from .config import Settings
+from .config import Settings, Spot
 from .modes import Mode, ModeController, StateStore
 from .spot_tracker import FREE, SpotTracker, TrackerEvent
 
@@ -60,6 +60,8 @@ class WatchConfig:
     backoff_max: float = 480.0
     state_max_age: float = 12 * 3600.0
     min_available_mb: float = 2500.0    # RAM guard for the tier-2 detector
+    cross_max_veto: float = 20 * 60.0   # stop vetoing on a persistent camera disagreement
+    cross_frame_max_age: float = 20.0   # reuse the other channel's frame only if this fresh
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "WatchConfig":
@@ -79,6 +81,7 @@ class WatchConfig:
             backoff_max=float(c.get("backoff_max_seconds", d.backoff_max)),
             state_max_age=float(c.get("state_max_age_hours", d.state_max_age / 3600)) * 3600,
             min_available_mb=float(settings.detection_tier2.get("min_available_mb", d.min_available_mb)),
+            cross_max_veto=float(c.get("cross_max_veto_minutes", d.cross_max_veto / 60)) * 60,
         )
 
 
@@ -198,6 +201,9 @@ class SpotWatch:
         }
         self.last_cycle = CycleInfo()
         self._next_full_at = 0.0
+        self._frames: dict[int, tuple[float, object]] = {}      # channel -> (ts, frame) of the latest read
+        self._cross_veto_since: dict[str, float] = {}
+        self.cross_overrides = 0
         self._restore_trackers()
 
     # ------------------------------------------------------------ persistence
@@ -306,6 +312,10 @@ class SpotWatch:
     async def _grab_and_detect(self, ch: int, back: list[int]) -> list:
         t0 = time.perf_counter()
         results = await self._reader(ch)
+        for r in results:
+            if getattr(r, "frame", None) is not None:
+                self._frames[ch] = (self._clock(), r.frame)
+                break
         h = self.health[ch]
         h.last_latency_ms = (time.perf_counter() - t0) * 1000
         h.last_ok = self._clock()
@@ -373,10 +383,89 @@ class SpotWatch:
                 # tier-2 again; with a reference the next cycle is a cheap compare.
                 self.stability.check(t2, tr.confirmed)
 
+        # Gate 3: a second camera that also sees this spot (ch3 sees both spots). It can
+        # only veto a "free" verdict, and only while it is not stuck disagreeing.
+        if not occupied and tr.confirmed != FREE and r.spot.cross is not None:
+            if await self._cross_sees_car(r.spot, tr):
+                occupied = True
+
         events = tr.observe(occupied, self._clock(), muted=self.controller.muted)
         self._save_tracker(tr)
         for ev in events:
             await self._announce(r, tr, ev)
+
+    async def _cross_frame(self, ch: int, spot) -> object | None:
+        """Latest frame of the other camera: this cycle's read if fresh, else one grab."""
+        got = self._frames.get(ch)
+        if got is not None and self._clock() - got[0] <= self.cfg.cross_frame_max_age:
+            return got[1]
+        if self.capture is None:
+            return None
+        try:
+            jpeg = await self.capture.grab(ch, self.cfg.subtype, expected_size=spot.frame_size)
+            frame = await asyncio.to_thread(self.detector.decode, jpeg)
+        except Exception as exc:  # noqa: BLE001 - an unavailable second camera is "no opinion"
+            log.info("cross-check: no frame from ch%s (%s)", ch, type(exc).__name__)
+            return None
+        self._frames[ch] = (self._clock(), frame)
+        return frame
+
+    def _cross_occupied(self, frame, cross_spot) -> bool:
+        """Occupancy of the spot as seen by the other camera (blocking; run in a thread).
+
+        Three opinions, any one saying "car" is enough (this is a veto, so a miss only
+        costs protection, never a false alert). Measured on ch3 over 30 h: the crop
+        passes find the car by day and miss it at night, a tier-2 pass over the WHOLE
+        frame finds it at night and misses it by day, so all three are used."""
+        full = self.detector.detect_array(frame)
+        res = self.detector.check_spot(frame, cross_spot, full)
+        if res.occupied:
+            return True
+        t2 = self.detector.check_spot_tier2(frame, cross_spot)
+        if t2 is not None and t2.occupied:
+            return True
+        h, w = getattr(frame, "shape", (cross_spot.frame_size[1], cross_spot.frame_size[0]))[:2]
+        whole = Spot("whole", cross_spot.channel, [(0, 0), (w, 0), (w, h), (0, h)], (w, h))
+        t3 = self.detector.check_spot_tier2(frame, whole)
+        if t3 is None:
+            return False
+        xs = [p[0] for p in cross_spot.polygon]
+        ys = [p[1] for p in cross_spot.polygon]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        pa = max(1.0, (x2 - x1) * (y2 - y1))
+        for d in t3.detections:
+            iw = max(0.0, min(d.box[2], x2) - max(d.box[0], x1))
+            ih = max(0.0, min(d.box[3], y2) - max(d.box[1], y1))
+            if iw * ih / pa >= 0.30:
+                return True
+        return False
+
+    async def _cross_sees_car(self, spot, tr: SpotTracker) -> bool:
+        """True = the second camera still sees a car, veto the free reading."""
+        cs = spot.cross
+        frame = await self._cross_frame(cs.channel, cs)
+        if frame is None:
+            return False
+        try:
+            seen = await asyncio.to_thread(self._cross_occupied, frame, cs)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cross-check failed for %r: %s", spot.name, exc)
+            return False
+        now = self._clock()
+        if not seen:
+            self._cross_veto_since.pop(spot.name, None)
+            return False
+        since = self._cross_veto_since.setdefault(spot.name, now)
+        if now - since > self.cfg.cross_max_veto:
+            # Two cameras disagreed for a long time: stop vetoing (the mapping may be
+            # wrong, or something is parked half-in) and let the alert through.
+            log.warning("cross-check: %r vetoed for %.0f min, ignoring the veto",
+                        spot.name, (now - since) / 60)
+            return False
+        self.cross_overrides += 1
+        log.info("cross_override: %r free on ch%s but ch%s still sees a car", spot.name,
+                 spot.channel, cs.channel)
+        return True
 
     async def _announce(self, r, tr: SpotTracker, ev: TrackerEvent) -> None:
         name = tr.name
