@@ -38,8 +38,12 @@ log = logging.getLogger(__name__)
 
 
 class Notifier(Protocol):
-    async def send_text(self, text: str, silent: bool = False) -> None: ...
-    async def send_photo(self, jpeg: bytes, caption: str) -> None: ...
+    """``ack=True`` asks for an inline "seen" button (GUARD alerts). Implementations
+    may ignore it. ``send_media_group`` is only used by GUARD evidence."""
+
+    async def send_text(self, text: str, silent: bool = False, **kw) -> None: ...
+    async def send_photo(self, jpeg: bytes, caption: str, **kw) -> None: ...
+    async def send_media_group(self, jpegs: list[bytes], caption: str, **kw) -> None: ...
 
 
 @dataclass
@@ -104,16 +108,28 @@ class Outbox:
         self.queue: deque[dict] = deque(maxlen=maxlen)
 
     async def _deliver(self, item: dict) -> None:
+        kw = {"ack": True} if item.get("ack") else {}
+        if item.get("jpegs") and len(item["jpegs"]) > 1:
+            try:
+                await self._n.send_media_group(item["jpegs"], item["text"])
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back to a single photo
+                log.warning("send_media_group failed (%s); trying one photo", exc)
+                item = {**item, "jpeg": item["jpegs"][0], "jpegs": None}
+        if item.get("jpegs"):
+            item = {**item, "jpeg": item["jpegs"][0]}
         if item["jpeg"]:
             try:
-                await self._n.send_photo(item["jpeg"], item["text"])
+                await self._n.send_photo(item["jpeg"], item["text"], **kw)
                 return
             except Exception as exc:  # noqa: BLE001 - fall back to text-only
                 log.warning("send_photo failed (%s); trying text", exc)
-        await self._n.send_text(item["text"], silent=item["silent"])
+        await self._n.send_text(item["text"], silent=item["silent"], **kw)
 
-    async def send(self, text: str, jpeg: bytes | None = None, silent: bool = False) -> bool:
-        item = {"text": text, "jpeg": jpeg, "silent": silent, "ts": self._clock()}
+    async def send(self, text: str, jpeg: bytes | None = None, silent: bool = False,
+                   jpegs: list[bytes] | None = None, ack: bool = False) -> bool:
+        item = {"text": text, "jpeg": jpeg, "jpegs": jpegs, "silent": silent, "ack": ack,
+                "ts": self._clock()}
         try:
             await self._deliver(item)
             return True
@@ -130,8 +146,9 @@ class Outbox:
             if age > self.msg_ttl:
                 log.warning("dropping queued message (%.0fs old)", age)
                 continue
-            if item["jpeg"] and age > self.image_ttl:
+            if (item["jpeg"] or item.get("jpegs")) and age > self.image_ttl:
                 item["jpeg"] = None
+                item["jpegs"] = None
             try:
                 await self._deliver(item)
             except Exception as exc:  # noqa: BLE001

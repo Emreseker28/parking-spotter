@@ -420,3 +420,68 @@ pipe grab, command handlers + application wiring with mocked Telegram).
 - Exit criterion "no new image files on the host during a run" holds for the Spot Watch runs
   (read-only rootfs, tmpfs state); the 48 h soak and a real "spot freed" walk-through remain.
 - `UNKNOWN` startup with the camera down sends the unreachable message but nothing else.
+
+## 2026-10-30 — Spot Watch & Guard plan, Phase 2: GUARD core
+
+Implemented, tested (213 unit tests) and live-checked on the real XVR; **not deployed** (the
+production container still runs Phase 1 + the rescheduling fix). Owner decisions this phase:
+`/guard` asks which spot the car is in; GUARD alerts are Turkish and carry the severity word
+(BİLGİ / UYARI / ALARM).
+
+**Modules:** `guard.py` (engine: persistent substream reader with backoff + stall watchdog,
+latest-frame-wins slot, evidence ring, dispatcher, ALERT repeat/`/ack`), `guard_gate.py` (host
+motion gate + XVR event listener), `guard_detector.py` (YOLOv8n on a crop window, person /
+bicycle / motorcycle / car), `guard_tracker.py` (SORT-style, time-based ageing),
+`guard_rules.py` (LOITER, CONTACT, MULTI), `guard_limiter.py` (duty-cycle limiter),
+`guard_geometry.py` (zones), `night.py` (D8). Commands: `/guard` (inline buttons: which spot),
+`/ack`, `/pause` (works from GUARD, keeps tracking muted), `/watch` (disarms), `/status`.
+
+**How it works:** arming = median of 5 main-stream reads of the car in the chosen spot (existing
+detector, tier-2 fallback for ch3) -> car zone; perimeter = zone +40 % width / +25 % height
+(or a manual polygon), scaled into 352x288 substream pixels (anisotropic). Idle = ffmpeg decode
++ a ~1 ms gate per frame, **zero YOLO**. YOLO (320 crop, ~38 ms) runs only while the motion
+gate / an XVR *human* event / a live track is active, capped at 4 fps and by the duty limiter
+(>40 % busy over 60 s -> raise motion threshold, then 4 -> 2 -> 1 fps, recover after 5 min calm,
+every step logged + sent as a silent INFO). A person standing still is kept alive by their
+track, so LOITER still fires. Evidence: raw frames in a RAM ring (8 s); on WARNING/ALERT the
+annotated key frame + up to 3 earlier frames go out as a media group (JPEG-encoded in RAM at
+that moment), followed by one main-stream snapshot (the substream is tiny). Never persisted.
+
+**Decisions**
+- Rules (defaults, night x0.6 via sunset-sunrise for Istanbul +/-30 min, because IR starts
+  before sunset): LOITER 10 s -> WARNING; CONTACT person box overlapping the car >=3 s -> ALERT;
+  MULTI >=2 people in the perimeter -> WARNING. ALERT repeats every 30 s until `/ack` or the
+  "Gördüm" button (capped at 10 repeats so a forgotten alert cannot spam forever); 60 s
+  per-rule cooldown; INFO is silent. CROUCH / VEHICLE_STOP / IMPACT / CAR_GONE are Phases 3-4.
+- XVR events gate on **`SmartMotionHuman` only**. Live finding: ch1 is a street and
+  `SmartMotionVehicle` fires every ~7 s, which kept YOLO active ~50 % of the time for rules
+  that are only about people. Codes are configurable (`guard.xvr_codes`).
+- Restart safety: a persisted GUARD is never trusted; the bot starts in SPOT_WATCH and re-arms
+  only if the camera still shows a car in that spot.
+- 320 model lives at `/mnt/storage/parking-spotter/models/yolov8n_320.onnx` (user-writable, no
+  sudo) and is mounted read-only at `/app/models-guard`; a 416 export sits next to it.
+
+**Live bug found and fixed:** the first live run showed ~96 fps from the 7 fps substream and
+43 % of a core: ffmpeg's rawvideo output duplicates frames up to the stream's 100 fps timebase.
+Fixed with `-fps_mode passthrough` (same quirk as the Phase 0 playback probe).
+
+**Measured (real XVR, read-only container pinned to CPUs 0,2, 700 MB, no swap)**
+- Idle, ch3: 604 frames/90 s (6.7 fps), **0 YOLO runs, 4.2 % of one core**; ch1 with a short
+  motion burst: 6.9 %. Peak cgroup memory 194-350 MB (includes arming), swap 0,
+  `nr_throttled = 0`. Arming takes 12-15 s.
+- Replay of 3 recorded evening windows (5 min each, ch3 21:00 and 23:00, ch1 20:00) through
+  the real pipeline: YOLO 117 / 155 / 0 runs, 3.9-7.1 % CPU, duty <= 5 %, **no alerts, no
+  person tracks** (no one was demonstrably in those clips; see gaps).
+- Detector decode checked on the standard bus photo (finds the people, ignores the bus).
+
+**Known gaps (be honest):**
+- **Person detection on these cameras is unvalidated.** No recorded window contained a known
+  person, so LOITER/CONTACT have only been exercised with scripted detections. ch3 is a steep
+  top-down IR view, where COCO YOLO is weakest. A live walk-through is needed.
+- The XVR search API only returns hourly "Timing" files (no event metadata), so past human
+  events cannot be located for replay. Event delay and night reliability remain unmeasured.
+- Latency (condition met -> sent) is only unit-tested (about one detection interval); the
+  <=3 s end-to-end target is not yet measured live over Telegram.
+- Jellyfin-contention test not done (needs a real transcode running). 48 h soak is Phase 4.
+- Until Phase 3 (`CAR_GONE`) GUARD does not notice if the car drives away; use `/watch`.
+- Evidence is 352x288 (substream); the main-stream follow-up photo is what a human can judge.

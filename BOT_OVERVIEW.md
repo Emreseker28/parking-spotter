@@ -1140,7 +1140,7 @@ For the running decisions log, see `docs/DECISIONS.md`.*
 
 ---
 
-## 19. Spot Watch & Guard modes (2026-10-30: Phase 0 probes done, Phase 1 SPOT_WATCH implemented)
+## 19. Spot Watch & Guard modes (2026-10-30: Phase 0 probes, Phase 1 SPOT_WATCH, Phase 2 GUARD)
 
 Two new runtime modes are planned: **SPOT_WATCH** (alert when a watched spot frees up, ~60 s cadence,
 both ch1 and ch3 spots) and **GUARD** (near-continuous watch for suspicious activity around the
@@ -1161,3 +1161,14 @@ failure handling, Telegram outbox, `/status`). Commands: `/watch /guard /auto /p
 10-minute push loop is superseded. The ffmpeg grab now uses a pipe (no temp files) so the
 container can run `read_only: true`, pinned with `cpuset: "0,2"`, 700 MB, no swap. Steady-state
 cost ~2.8 % of one core. See `docs/DECISIONS.md` (Phase 1 entry) for numbers and gaps.
+
+**Phase 2 (implemented, pending deploy): GUARD.** `/guard` asks which spot the car is in, arms on
+the car (median of 5 reads), then watches a perimeter (+40 %/+25 %) on the 352x288 substream.
+Idle = decode + a ~1 ms motion gate, no YOLO; YOLO (320 crop) runs only on motion / XVR human
+event / live track, rate-capped by a duty-cycle limiter. Rules LOITER / CONTACT / MULTI produce
+Turkish alerts with an explicit severity (BİLGİ / UYARI / ALARM); ALARM repeats every 30 s until
+`/ack`. Evidence is a RAM ring buffer, JPEG-encoded only when an alert fires. Files:
+`guard.py`, `guard_gate.py`, `guard_detector.py`, `guard_tracker.py`, `guard_rules.py`,
+`guard_limiter.py`, `guard_geometry.py`, `night.py`; new config section `guard:`; the 320 model is
+mounted from `/mnt/storage/parking-spotter/models` at `/app/models-guard`. Person detection on
+the real cameras still needs a live walk-through (see the DECISIONS Phase 2 entry).

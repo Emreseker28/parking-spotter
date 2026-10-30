@@ -24,6 +24,8 @@ services:
       # On the dedicated storage volume — NOT the root SSD, NOT the read-only
       # /mnt/models mount. Phase 0 task 1.
       - /mnt/storage/parking-spotter/data:/app/data
+      # Small GUARD detector export (yolov8n_320.onnx) on the user-writable storage disk.
+      - /mnt/storage/parking-spotter/models:/app/models-guard:ro
       # SQLite state only (mode, settings, per-spot tracker state) -- never images.
       - /mnt/storage/parking-spotter/state:/app/state
 

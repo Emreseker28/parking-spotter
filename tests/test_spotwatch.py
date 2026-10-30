@@ -330,7 +330,7 @@ class SpotWatchTest(unittest.TestCase):
         h = self.h
         h.cycle()
         h.controller.guard_available = True
-        h.controller.set_manual(Mode.GUARD)
+        h.controller.set_manual(Mode.GUARD, self.a)
         reads = len(h.cam.reads)
         h.cycle(60)
         self.assertEqual(len(h.cam.reads), reads)

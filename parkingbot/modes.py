@@ -5,8 +5,8 @@ against the camera). The database holds settings, mode state and per-spot tracke
 state only -- numbers and text, never image bytes (the container rootfs is
 read-only; this file lives on the one small writable state volume).
 
-Phase 1 ships manual switching only; GUARD itself arrives in Phase 2, so setting
-it raises ``ModeUnavailable`` until ``guard_available`` is turned on.
+Manual switching only (automatic switching is Phase 3). Setting GUARD raises
+``ModeUnavailable`` unless ``guard_available`` is on, and needs the guarded spot.
 """
 
 from __future__ import annotations
@@ -86,6 +86,8 @@ class ModeController:
         self.auto: bool = bool(store.get("auto", False))
         self.paused_until: float | None = store.get("paused_until")
         self.resume_mode: Mode = Mode.SPOT_WATCH
+        self.guard_spot: str | None = store.get("guard_spot")   # name of the guarded spot
+        self.resume_guard: str | None = None   # set by verify(): re-arm this spot if the car is still there
         self.persisted: Mode = self._load_persisted()
         self._entered_watch = False
 
@@ -108,6 +110,13 @@ class ModeController:
         )
 
     @property
+    def guarding(self) -> bool:
+        """GUARD logic should run (it keeps tracking while paused, muted)."""
+        return self.mode == Mode.GUARD or (
+            self.mode == Mode.PAUSED and self.resume_mode == Mode.GUARD
+        )
+
+    @property
     def pause_remaining(self) -> float:
         if self.mode != Mode.PAUSED or self.paused_until is None:
             return 0.0
@@ -119,6 +128,7 @@ class ModeController:
         self.store.set("auto", self.auto)
         self.store.set("paused_until", self.paused_until)
         self.store.set("resume_mode", self.resume_mode.value)
+        self.store.set("guard_spot", self.guard_spot)
 
     def _enter(self, mode: Mode) -> None:
         # Re-arm alerts only on a real entry; pausing/resuming keeps watching.
@@ -146,20 +156,30 @@ class ModeController:
             self._persist()
             log.info("mode verified -> PAUSED (%.0fs left)", self.pause_remaining)
             return self.mode
-        target = Mode.GUARD if (self.persisted == Mode.GUARD and self.guard_available) \
-            else Mode.SPOT_WATCH
+        # A persisted GUARD is never trusted blindly: start in SPOT_WATCH and let the
+        # caller re-arm only if the car is still in the spot (verified on the camera).
+        if self.persisted == Mode.GUARD and self.guard_available and self.guard_spot:
+            self.resume_guard = self.guard_spot
         self.paused_until = None
-        self._enter(target)
+        self._enter(Mode.SPOT_WATCH)
         return self.mode
 
-    def set_manual(self, mode: Mode) -> None:
-        """/watch or /guard: manual control, overrides auto until /auto."""
+    def set_manual(self, mode: Mode, guard_spot: str | None = None) -> None:
+        """/watch or /guard: manual control, overrides auto until /auto.
+        GUARD needs the name of the spot the owner's car is in."""
         if mode == Mode.GUARD and not self.guard_available:
-            raise ModeUnavailable("GUARD is not implemented yet (Phase 2)")
+            raise ModeUnavailable("GUARD is not available")
         if mode not in (Mode.SPOT_WATCH, Mode.GUARD):
             raise ValueError(f"cannot set {mode} manually")
+        if mode == Mode.GUARD:
+            if not guard_spot:
+                raise ValueError("GUARD needs the spot the car is in")
+            self.guard_spot = guard_spot
+        else:
+            self.guard_spot = None
         self.auto = False
         self.paused_until = None
+        self.resume_guard = None
         self._enter(mode)
 
     def set_auto(self, on: bool) -> None:

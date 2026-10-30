@@ -84,6 +84,10 @@ class Settings:
         return self.raw.get("spotwatch", {})
 
     @property
+    def guard(self) -> dict:
+        return self.raw.get("guard", {})
+
+    @property
     def inference(self) -> dict:
         return self.raw.get("inference", {})
 

@@ -167,3 +167,49 @@ spotwatch:
   state_db: "state/spotter.db"  # SQLite: mode, settings, tracker state (never images)
   state_max_age_hours: 12       # restore tracker state on restart only if this fresh
   timezone: "Europe/Istanbul"   # camera clock is UTC+3; also used for "night"
+
+# GUARD mode: watch the owner's parked car for suspicious activity (Phase 2).
+# /guard asks which spot the car is in, finds it (median of ~5 reads) and builds a
+# car zone + perimeter. The pipeline runs on the SUBSTREAM (352x288 @ <=7 fps on this
+# XVR) and only runs YOLO while there is motion / an XVR event / a live track.
+# No image or video is written to disk: frames stay in RAM, evidence is JPEG-encoded
+# in memory only when an alert fires.
+guard:
+  enabled: true
+  # Small static-input YOLOv8n export (320). Lives on the user-writable storage disk and
+  # is mounted read-only at /app/models-guard (see docker-compose.yml).
+  model_path: "models-guard/yolov8n_320.onnx"
+  model_threads: 1              # 1 thread on the pinned core (2nd hyperthread gains ~10-15 %)
+  conf: 0.30
+  detect_fps: 4                 # max YOLO rate while active; the limiter lowers it 4->2->1
+  tail_seconds: 10              # keep detecting this long after the last motion/event
+  gate: both                    # motion | xvr | both (OR). XVR delay/night reliability unmeasured
+  xvr_codes: [SmartMotionHuman] # vehicle events fire every few s on a street; every rule here is about people
+  gate_min_frac: 0.004          # share of the perimeter crop that must change
+  gate_global_frac: 0.40        # more than this changing at once = headlights/IR switch: ignored
+  perimeter_dilate_w: 0.40      # perimeter = car zone +40 % width ...
+  perimeter_dilate_h: 0.25      # ... +25 % height
+  # perimeters:                 # optional manual polygon per spot, in MAIN-stream pixels
+  #   "ev önü": [[x, y], [x, y], [x, y], [x, y]]
+  duty_limit: 0.40              # max share of any 60 s the detector may be busy
+  duty_window_seconds: 60
+  recover_after_seconds: 300
+  alert_repeat_seconds: 30      # ALERT repeats until /ack (D7) ...
+  alert_repeat_max: 10          # ... at most this many times
+  cooldown_seconds: 60          # min gap between alerts of the same rule
+  evidence_seconds: 8           # RAM ring buffer of raw frames (never persisted)
+  evidence_prev_frames: 3
+  followup_main_snapshot: true  # one main-stream photo after an alert (substream is tiny)
+  rules:
+    loiter_seconds: 10          # person inside the perimeter this long -> WARNING
+    contact_seconds: 3          # person box overlapping the car this long -> ALERT
+    multi_seconds: 2            # 2+ people inside the perimeter -> WARNING
+    contact_overlap: 0.10       # share of the person's box inside the car box
+    night_factor: 0.6           # durations x0.6 at night (10 s -> 6 s)
+  night:                        # decision D8
+    mode: sun                   # sun (sunset-sunrise for lat/lon) | fixed (local hours)
+    lat: 41.0
+    lon: 29.0
+    margin_minutes: 30          # IR switches on well before sunset
+    start_hour: 19              # used when mode: fixed
+    end_hour: 6

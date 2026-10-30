@@ -43,11 +43,36 @@ class ModesTest(unittest.TestCase):
         self.assertEqual(c.verify(), Mode.SPOT_WATCH)
         self.assertTrue(c.watching)
 
-    def test_persisted_guard_falls_back_in_phase1(self):
-        c = self.ctl(); c.guard_available = True; c.verify(); c.set_manual(Mode.GUARD)
-        c2 = self.ctl()
+    def test_persisted_guard_is_reverified_not_trusted(self):
+        c = self.ctl(); c.guard_available = True; c.verify(); c.set_manual(Mode.GUARD, "Ön")
+        c2 = self.ctl(); c2.guard_available = True
         self.assertEqual(c2.persisted, Mode.GUARD)
-        self.assertEqual(c2.verify(), Mode.SPOT_WATCH)     # GUARD not available
+        self.assertEqual(c2.verify(), Mode.SPOT_WATCH)      # never GUARD until re-armed
+        self.assertEqual(c2.resume_guard, "Ön")             # caller re-arms if the car is there
+
+    def test_persisted_guard_without_guard_available_just_watches(self):
+        c = self.ctl(); c.guard_available = True; c.verify(); c.set_manual(Mode.GUARD, "Ön")
+        c2 = self.ctl()
+        self.assertEqual(c2.verify(), Mode.SPOT_WATCH)
+        self.assertIsNone(c2.resume_guard)
+
+    def test_guard_needs_a_spot_and_watch_clears_it(self):
+        c = self.ctl(); c.guard_available = True; c.verify()
+        with self.assertRaises(ValueError):
+            c.set_manual(Mode.GUARD)
+        c.set_manual(Mode.GUARD, "ev önü")
+        self.assertTrue(c.guarding and not c.watching)
+        self.assertEqual(c.guard_spot, "ev önü")
+        c.set_manual(Mode.SPOT_WATCH)
+        self.assertIsNone(c.guard_spot)
+        self.assertTrue(c.watching and not c.guarding)
+
+    def test_pause_in_guard_keeps_guarding_muted(self):
+        c = self.ctl(); c.guard_available = True; c.verify(); c.set_manual(Mode.GUARD, "x")
+        c.pause(60)
+        self.assertTrue(c.muted and c.guarding and not c.watching)
+        c.resume()
+        self.assertEqual(c.mode, Mode.GUARD)
 
     def test_guard_unavailable(self):
         c = self.ctl(); c.verify()
