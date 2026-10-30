@@ -355,13 +355,18 @@ class ParkingBot:
     # ----------------------------------------------------- Spot Watch commands
     def _schedule_spotwatch(self, when: float) -> None:
         """Keep exactly one pending Spot Watch job: replace any scheduled one."""
-        if self._sw_job is not None:
-            self._sw_job.schedule_removal()
+        job, self._sw_job = self._sw_job, None
+        if job is not None:
+            try:
+                job.schedule_removal()
+            except Exception as exc:  # noqa: BLE001 - already fired/removed: nothing to cancel
+                log.debug("spotwatch job already gone: %s", exc)
         self._sw_job = self._job_queue.run_once(self.spotwatch_job, when=when)
 
     async def spotwatch_job(self, context: ContextTypes.DEFAULT_TYPE):
         """Run one cycle and ALWAYS reschedule (a crash must never end the loop)."""
         delay = float(self.spotwatch.cfg.interval)
+        self._sw_job = None   # this job has fired; there is nothing pending to cancel
         try:
             delay = await self.spotwatch.run_cycle()
         except Exception as exc:  # noqa: BLE001

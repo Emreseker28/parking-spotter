@@ -106,6 +106,49 @@ class CommandsTest(unittest.TestCase):
         self.assertIn("kapalı", sent[0])
 
 
+class ReschedulingTest(unittest.TestCase):
+    """Regression: the running job removing itself raised JobLookupError in
+    production (the fired job is already gone) and killed the loop after 1 cycle."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.settings = load_settings()
+        self.settings.raw["spotwatch"] = {**self.settings.raw.get("spotwatch", {}),
+                                          "enabled": True,
+                                          "state_db": str(Path(self._tmp.name) / "s.db")}
+        self.bot = ParkingBot(self.settings)
+        self.jq = FakeJobQueue()
+        self.bot.init_spotwatch(MagicMock(), self.jq)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_job_reschedules_even_if_removing_the_stale_handle_raises(self):
+        stale = MagicMock()
+        stale.schedule_removal.side_effect = RuntimeError("No job by the id of x was found")
+        self.bot._sw_job = stale
+        self.bot._schedule_spotwatch(5)           # must not raise
+        self.assertEqual(len(self.jq.jobs), 1)
+
+    def test_spotwatch_job_always_reschedules(self):
+        async def cycle():
+            return 42.0
+        self.bot.spotwatch.run_cycle = cycle
+        fired = MagicMock()
+        fired.schedule_removal.side_effect = RuntimeError("already fired")
+        self.bot._sw_job = fired                  # the handle of the job now running
+        asyncio.run(self.bot.spotwatch_job(SimpleNamespace()))
+        fired.schedule_removal.assert_not_called()   # the running job is not cancelled
+        self.assertEqual([w for _, w, _ in self.jq.jobs], [42.0])
+
+    def test_crashing_cycle_still_reschedules(self):
+        async def boom():
+            raise RuntimeError("cycle crashed")
+        self.bot.spotwatch.run_cycle = boom
+        asyncio.run(self.bot.spotwatch_job(SimpleNamespace()))
+        self.assertEqual([w for _, w, _ in self.jq.jobs], [self.bot.spotwatch.cfg.interval])
+
+
 class DurationTest(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(parse_duration("10m"), 600)
