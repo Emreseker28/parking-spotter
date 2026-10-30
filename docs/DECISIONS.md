@@ -601,3 +601,39 @@ warms up for 4 s before taking its reference; live similarity is 0.94 / 0.76. (T
 Prometheus container times out while the endpoint is up), the scrape job is not in `~/monitoring/prometheus.yml`
 (not this repo's stack) and the dashboard is not imported. Steps in `docs/METRICS.md`. Still open for Phase 4:
 CROUCH / IMPACT / VEHICLE_STOP, night tuning and false-positive review, the 48 h soak.
+
+## 2026-10-30 — GUARD false alarms on street pedestrians (owner report: "margin too wide")
+
+**Owner report:** a person walking in the street was detected as an intruder.
+**What the logs said:** both alerts were `CONTACT` (ALARM, held ~2 s), not LOITER — so the perimeter margin was
+not the main cause. Replaying the recorded ch1 substream at 22:39 and 22:44 against the production zones
+showed the culprits were pedestrians on the lane beside / behind the car, whose boxes overlap the car's
+image box by 15-30 % (camera angle) while their CENTRES stay outside it.
+
+**Two defects, one real, one geometric (found by replaying real clips through the rules engine):**
+1. *Coasting counted as contact.* One detection followed by ~2 s of the tracker coasting on a stale box was
+   treated as "touching the car for 2 s" (`pts=1` in the trace). Also produced 3 spurious CONTACTs in the
+   owner's own walk-through. Fix: CONTACT counts only frames where the track was actually seen recently and
+   needs >= 3 real detections in the window (scaled to the current YOLO rate, so it still works at 1 fps).
+2. *Edge overlap is not contact.* Fix: the person's CENTRE must be inside the car box grown by 6 %
+   (`contact_center_margin`), not merely overlap it by 10 %.
+
+**Perimeter narrowed as requested:** +40 %/+25 % -> **+16 %/+10 %** (`perimeter_dilate_w/h`; per-spot
+`perimeter_margin` override available).
+
+**Evidence (replay of 3 recorded clips, night thresholds):**
+| settings | pedestrian 22:39 | pedestrian 22:44 | owner walk-through 21:43 |
+|---|---|---|---|
+| before | CONTACT | CONTACT | MULTI, CONTACT x4, LOITER |
+| real-detections rule only | CONTACT | CONTACT | MULTI, CONTACT, LOITER |
+| + centre test, margin .40/.25 | none | none | MULTI, CONTACT, LOITER |
+| + centre test, margin **.16/.10** (chosen) | none | none | MULTI, CONTACT, LOITER |
+| + centre test, margin .10/.08 | none | none | MULTI, CONTACT (LOITER lost) |
+The centre test is what silences passers-by; narrowing the margin alone changed nothing for CONTACT. .16/.10 is
+the narrowest margin that kept the owner's LOITER. Regression tests embed the real recorded detections of both
+false alarms (309/309 tests).
+
+**Caveats:** two pedestrian events and one walk-through is a small sample. Someone walking *very* slowly right
+along the car's flank could still look like contact, and a thief who only brushes past for < 1.8 s will not alarm
+(that is the trade-off). Day thresholds are longer (3 s) so daytime is stricter still. CROUCH/IMPACT will need
+the same replay-first treatment. Not deployed yet.

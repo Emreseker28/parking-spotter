@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from parkingbot.guard_geometry import Zones
+from parkingbot.guard_geometry import Zones, box_poly, dilate_box
 from parkingbot.guard_rules import ALERT, WARNING, RuleConfig, RulesEngine
 from parkingbot.guard_tracker import Det, Tracker
 
@@ -126,3 +126,79 @@ class RulesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- regressions from REAL false alarms on ch1 (2026-10-30 22:39 and 22:44) --------------------
+# Substream pixels. Car zone and perimeter as armed in production (perimeter now +16 % / +10 %).
+REAL_CAR = (116.0, 117.0, 185.0, 207.0)
+REAL_ZONES = Zones((352, 288), REAL_CAR, box_poly(dilate_box(REAL_CAR, 0.16, 0.10, 352, 288)))
+
+# person detections (clip seconds, box) of the pedestrian who walked down the lane beside the car
+PED_BESIDE = [(28.7, (100, 113, 124, 178)), (28.9, (98, 114, 123, 179)), (29.0, (97, 116, 122, 186)),
+              (29.1, (96, 121, 121, 192)), (29.3, (96, 123, 120, 193)), (29.4, (95, 123, 120, 193)),
+              (29.6, (94, 126, 120, 201)), (30.0, (92, 135, 118, 211)), (30.1, (93, 139, 119, 217)),
+              (30.3, (93, 144, 123, 224)), (30.4, (94, 148, 123, 226)),
+              (31.0, (104, 159, 142, 233)),                      # ONE detection, then nothing for 2 s
+              (33.0, (104, 89, 127, 136))]
+# pedestrian who walked behind (up the street from) the car, left to right
+PED_BEHIND = [(36.0 + i * 0.12, b) for i, b in enumerate([
+    (87, 101, 99, 170), (87, 103, 97, 170), (87, 103, 100, 170), (87, 101, 101, 165), (88, 99, 103, 162),
+    (88, 98, 104, 162), (88, 98, 104, 163), (89, 95, 104, 161), (90, 92, 105, 153), (91, 90, 106, 152),
+    (92, 90, 106, 152), (93, 90, 110, 151), (95, 90, 111, 149), (97, 90, 113, 147), (98, 89, 114, 145),
+    (101, 89, 116, 144), (101, 89, 116, 140), (102, 89, 118, 138), (104, 89, 121, 138), (106, 89, 120, 138),
+    (107, 89, 122, 136), (108, 89, 123, 135), (109, 89, 125, 133), (110, 89, 126, 135)])]
+
+
+def replay(series, end, night=True, fps=4.0, cfg=None):
+    rules, tr, events = RulesEngine(cfg or RuleConfig()), Tracker(), []
+    t = series[0][0]
+    by_t = {round(ts, 2): b for ts, b in series}
+    while t <= end:
+        b = by_t.get(round(t, 2))
+        persons = [x for x in tr.update([Det(0, "person", 0.7, tuple(map(float, b)))] if b else [], t)
+                   if x.cls == 0]
+        events += rules.update(persons, REAL_ZONES, t, night, fps=fps)
+        t = round(t + 0.1, 2)
+    return events
+
+
+class RealPedestrianRegressionTest(unittest.TestCase):
+    def test_pedestrian_walking_down_the_lane_beside_the_car_raises_nothing(self):
+        self.assertEqual(replay(PED_BESIDE, 36.0), [])
+
+    def test_pedestrian_walking_behind_the_car_raises_nothing(self):
+        self.assertEqual(replay(PED_BEHIND, 44.0), [])
+
+    def test_a_single_detection_followed_by_coasting_is_not_contact(self):
+        inside = (130.0, 130.0, 160.0, 200.0)                         # centre well inside the car box
+        ev = replay([(10.0, inside)], 14.0)
+        self.assertEqual([e for e in ev if e.rule == "CONTACT"], [])
+
+    def test_someone_actually_at_the_car_still_raises_contact(self):
+        inside = (130.0, 130.0, 160.0, 200.0)
+        series = [(10.0 + i * 0.25, inside) for i in range(16)]       # 4 s of repeated detections
+        ev = [e for e in replay(series, 15.0) if e.rule == "CONTACT"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0].severity, ALERT)
+
+    def test_contact_still_works_when_the_limiter_drops_yolo_to_1_fps(self):
+        inside = (130.0, 130.0, 160.0, 200.0)
+        series = [(10.0 + i, inside) for i in range(6)]               # one detection per second
+        ev = [e for e in replay(series, 17.0, fps=1.0) if e.rule == "CONTACT"]
+        self.assertEqual(len(ev), 1)
+
+    def test_centre_must_be_at_the_car_not_just_overlapping_its_box(self):
+        edge = (90.0, 120.0, 124.0, 190.0)                            # overlaps the car box edge ~20 %,
+        series = [(10.0 + i * 0.25, edge) for i in range(20)]         # centre x=107 is outside it
+        self.assertEqual([e for e in replay(series, 15.0) if e.rule == "CONTACT"], [])
+        wide = RuleConfig(contact_center_margin=100.0)                # the old behaviour
+        self.assertEqual(len([e for e in replay(series, 15.0, cfg=wide) if e.rule == "CONTACT"]), 1)
+
+    def test_default_perimeter_margin_is_narrow(self):
+        from parkingbot.config import load_settings
+        from parkingbot.guard import GuardConfig
+        c = GuardConfig.from_settings(load_settings())
+        self.assertLessEqual(c.dil_w, 0.20)
+        self.assertLessEqual(c.dil_h, 0.12)
+        self.assertEqual(c.rules.contact_min_hits, 3)
+        self.assertGreater(c.rules.contact_center_margin, 0.0)

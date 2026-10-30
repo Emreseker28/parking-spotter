@@ -69,6 +69,7 @@ class GuardConfig:
     track_max_age: float = 3.0
     dil_w: float = 0.40
     dil_h: float = 0.25
+    dilations: dict = field(default_factory=dict)    # spot name -> (dil_w, dil_h) override
     gate: str = "both"                   # motion | xvr | both (OR)
     xvr_codes: tuple = ("SmartMotionHuman",)   # vehicle events fire every few s on a street
     gate_min_frac: float = 0.004
@@ -124,6 +125,9 @@ class GuardConfig:
             track_max_age=float(c.get("track_max_age_seconds", d.track_max_age)),
             dil_w=float(c.get("perimeter_dilate_w", d.dil_w)),
             dil_h=float(c.get("perimeter_dilate_h", d.dil_h)),
+            dilations={k: (float(v.get("w", c.get("perimeter_dilate_w", d.dil_w))),
+                           float(v.get("h", c.get("perimeter_dilate_h", d.dil_h))))
+                       for k, v in (c.get("perimeter_margin", {}) or {}).items()},
             gate=str(c.get("gate", d.gate)),
             xvr_codes=tuple(c.get("xvr_codes", d.xvr_codes)),
             gate_min_frac=float(c.get("gate_min_frac", d.gate_min_frac)),
@@ -167,6 +171,8 @@ class GuardConfig:
                 contact_s=float(r.get("contact_seconds", 3)),
                 multi_s=float(r.get("multi_seconds", 2)),
                 contact_overlap=float(r.get("contact_overlap", 0.10)),
+                contact_center_margin=float(r.get("contact_center_margin", 0.06)),
+                contact_min_hits=int(r.get("contact_min_hits", 3)),
                 night_factor=float(r.get("night_factor", 0.6)),
             ),
         )
@@ -272,8 +278,9 @@ class GuardEngine:
             log.error("guard model unavailable: %s", exc)
             return False, f"GUARD modeli yüklenemedi: {exc}"
         main_size = spot.frame_size or (960, 576)
-        self.zones = build_zones(boxes, main_size, self.cfg.sub_size, self.cfg.dil_w,
-                                 self.cfg.dil_h, self.cfg.perimeters.get(spot.name))
+        dil_w, dil_h = self.cfg.dilations.get(spot.name, (self.cfg.dil_w, self.cfg.dil_h))
+        self.zones = build_zones(boxes, main_size, self.cfg.sub_size, dil_w, dil_h,
+                                 self.cfg.perimeters.get(spot.name))
         self._start(spot)
         c = self.zones.car
         log.info("guard armed on %r: car(sub)=%s perimeter=%s window=%s reads=%d/%d",
@@ -478,7 +485,7 @@ class GuardEngine:
             keep.append(d)
         tracks = self.tracker.update(keep, ts)
         persons = [t for t in tracks if t.cls == 0]
-        events = self.rules.update(persons, zones, ts, self._is_night(ts))
+        events = self.rules.update(persons, zones, ts, self._is_night(ts), fps=self.limiter.fps)
         for ev in events:
             await self._dispatch(ev, frame, ts, persons)
         return events

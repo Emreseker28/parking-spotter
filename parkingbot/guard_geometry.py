@@ -88,6 +88,12 @@ class Zones:
     def in_perimeter(self, pt: tuple[float, float]) -> bool:
         return point_in_poly(pt, self.perimeter)
 
+    def contains_car(self, pt: tuple[float, float], margin: float = 0.0) -> bool:
+        """Is ``pt`` inside the car box grown by ``margin`` (fraction of its size) per side?"""
+        w, h = self.frame_size
+        x1, y1, x2, y2 = dilate_box(self.car, 2 * margin, 2 * margin, w, h) if margin else self.car
+        return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
+
     def detect_window(self, margin: float = 0.15) -> tuple[int, int, int, int]:
         """Crop window for the detector: the perimeter bbox plus a margin, as ints."""
         w, h = self.frame_size

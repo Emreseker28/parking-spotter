@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .guard_geometry import Zones, area, center, inter_area
+from .guard_geometry import Zones, area, center, dilate_box, inter_area
 from .guard_tracker import Track
 
 INFO, WARNING, ALERT = "INFO", "WARNING", "ALERT"
@@ -35,6 +35,15 @@ class RuleConfig:
     contact_s: float = 3.0
     multi_s: float = 2.0
     contact_overlap: float = 0.10     # share of the person's box inside the car box
+    # ...AND the person's CENTRE must be inside the car box grown by this fraction per side.
+    # From the real ch1 false alarms: a passer-by on the street has a box that overlaps the
+    # car's image box by 15-30 % (camera angle) but a centre clearly outside it.
+    contact_center_margin: float = 0.06
+    # CONTACT must be made of real detections, not coasting: the track has to have been seen
+    # within the last ``obs`` seconds and re-detected at least ``min_hits`` times during the
+    # contact. (Real ch1 false alarm: ONE detection + ~2 s of coasting on a stale box counted
+    # as "touching the car for 2 s".) Both scale with the current YOLO rate.
+    contact_min_hits: int = 3
     contact_gap_s: float = 1.0        # tolerated detection gap inside a contact episode
     night_factor: float = 0.6         # durations x this at night
     multi_rearm_s: float = 10.0
@@ -48,6 +57,11 @@ class _TrackState:
     contact_since: float | None = None
     contact_last: float | None = None
     contact_fired: bool = False
+    contact_hits0: int = 0
+
+
+def contact_s_for(cfg: "RuleConfig", k: float) -> float:
+    return cfg.contact_s * k
 
 
 class RulesEngine:
@@ -65,8 +79,10 @@ class RulesEngine:
         self._multi_clear_since = None
 
     def update(self, persons: list[Track], zones: Zones, now: float,
-               night: bool = False) -> list[GuardEvent]:
+               night: bool = False, fps: float = 4.0) -> list[GuardEvent]:
         k = self.cfg.night_factor if night else 1.0
+        obs_s = max(0.8, 1.6 / max(fps, 0.1))                    # "seen recently" window
+        min_hits = max(2, min(self.cfg.contact_min_hits, int(contact_s_for(self.cfg, k) * fps)))
         loiter_s, contact_s, multi_s = (self.cfg.loiter_s * k, self.cfg.contact_s * k,
                                         self.cfg.multi_s * k)
         events: list[GuardEvent] = []
@@ -99,12 +115,16 @@ class RulesEngine:
             # CONTACT: the person's box overlaps the car box for a sustained time.
             pa = area(t.box)
             overlap = inter_area(t.box, zones.car) / pa if pa > 0 else 0.0
-            if overlap >= self.cfg.contact_overlap:
+            m = self.cfg.contact_center_margin
+            at_car = zones.contains_car(center(t.box), m)
+            observed = now - t.last_ts <= obs_s
+            if overlap >= self.cfg.contact_overlap and at_car and observed:
                 if st.contact_since is None:
                     st.contact_since = now
+                    st.contact_hits0 = t.hits
                 st.contact_last = now
                 held = now - st.contact_since
-                if held >= contact_s and not st.contact_fired:
+                if held >= contact_s and (t.hits - st.contact_hits0) >= min_hits and not st.contact_fired:
                     st.contact_fired = True
                     events.append(GuardEvent("CONTACT", ALERT, st.contact_since + contact_s,
                                              t.id, held, len(persons)))

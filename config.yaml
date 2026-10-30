@@ -195,8 +195,10 @@ guard:
   xvr_codes: [SmartMotionHuman] # vehicle events fire every few s on a street; every rule here is about people
   gate_min_frac: 0.004          # share of the perimeter crop that must change
   gate_global_frac: 0.40        # more than this changing at once = headlights/IR switch: ignored
-  perimeter_dilate_w: 0.40      # perimeter = car zone +40 % width ...
-  perimeter_dilate_h: 0.25      # ... +25 % height
+  perimeter_dilate_w: 0.16      # perimeter = car zone +16 % width ... (was +40 %: pedestrians on the
+  perimeter_dilate_h: 0.10      # ... +10 % height                         street beside the car were caught)
+  # perimeter_margin:           # optional per-spot override of the two numbers above
+  #   "ev önü": {w: 0.20, h: 0.12}
   # perimeters:                 # optional manual polygon per spot, in MAIN-stream pixels
   #   "ev önü": [[x, y], [x, y], [x, y], [x, y]]
   duty_limit: 0.40              # max share of any 60 s the detector may be busy
@@ -212,7 +214,11 @@ guard:
     loiter_seconds: 10          # person inside the perimeter this long -> WARNING
     contact_seconds: 3          # person box overlapping the car this long -> ALERT
     multi_seconds: 2            # 2+ people inside the perimeter -> WARNING
-    contact_overlap: 0.10       # share of the person's box inside the car box
+    contact_overlap: 0.10       # share of the person's box inside the car box ...
+    contact_center_margin: 0.06 # ... AND the person's centre inside the car box grown by this
+                                # (a passer-by's box overlaps the car in the image, their centre does not)
+    contact_min_hits: 3         # ... and re-detected this often (scales down at low YOLO rates);
+                                # ONE detection + coasting used to count as 2 s of contact
     night_factor: 0.6           # durations x0.6 at night (10 s -> 6 s)
   # CAR_GONE / departure (substream presence check, confirmed on the main stream)
   presence_check_seconds: 5     # compare the car zone to its reference this often (no YOLO)
