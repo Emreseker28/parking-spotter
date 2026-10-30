@@ -1182,3 +1182,8 @@ Inside GUARD a substream presence check notices a vanished car: ALARM "ARAÇ Gİ
 and the car has been gone ~90 s. Files: `appearance.py`, `car_store.py`, `matcher.py`, `autoswitch.py`,
 `carfinder.py`, `guard_presence.py`; config sections `auto:` and the CAR_GONE keys under `guard:`.
 Hard-negative accuracy (same model in the same spot) is untested; see the DECISIONS Phase 3 entry.
+
+**Phase 4 (started): Prometheus metrics.** `metrics.py` exports numbers only on `:9108/metrics` (mode, spot
+states, alerts by severity, rule latency histogram, frame age, YOLO duty / limiter step, camera health,
+auto-switch outcomes, container CPU / memory / throttling, host RAM and swap). Dashboard
+`docs/grafana-parking-spotter.json`; wiring (firewall, scrape job, import) in `docs/METRICS.md`.

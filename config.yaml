@@ -256,3 +256,11 @@ auto:
     min_refs: 5
     negative_pull: 0.15
     geom_weight: 0.25
+
+# Prometheus metrics (text and numbers only). The bot runs with network_mode: host, so this
+# listens on the host; Prometheus (in Docker) scrapes host.docker.internal:9108, the same pattern
+# as the OCR service on :9099. Restrict the port to the Docker subnets with ufw.
+metrics:
+  enabled: true
+  bind: "0.0.0.0"
+  port: 9108

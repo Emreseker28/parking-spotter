@@ -35,6 +35,7 @@ from .guard_limiter import DutyLimiter
 from .guard_presence import PresenceMonitor
 from .guard_rules import ALERT, INFO, WARNING, GuardEvent, RuleConfig, RulesEngine
 from .guard_tracker import Det, Tracker
+from .metrics import NULL
 from .modes import Mode, ModeController
 from .night import is_night
 
@@ -186,8 +187,10 @@ class ActiveAlert:
 class GuardEngine:
     def __init__(self, settings: Settings, controller: ModeController, capture, detector,
                  outbox, clock: Callable[[], float] = time.time, cfg: GuardConfig | None = None,
-                 guard_detector: GuardDetector | None = None, tz=None, source_factory=None):
+                 guard_detector: GuardDetector | None = None, tz=None, source_factory=None,
+                 metrics=NULL):
         self.settings = settings
+        self.metrics = metrics
         self.cfg = cfg or GuardConfig.from_settings(settings)
         self.controller = controller
         self.capture = capture
@@ -371,10 +374,12 @@ class GuardEngine:
                 raise
             except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError) as exc:
                 self.reconnects += 1
+                self.metrics.reconnect()
                 log.warning("guard source lost (%s); reconnecting in %.0fs",
                             type(exc).__name__, backoff)
             except Exception:  # noqa: BLE001
                 self.reconnects += 1
+                self.metrics.reconnect()
                 log.exception("guard source crashed; reconnecting in %.0fs", backoff)
             finally:
                 if proc is not None and proc.returncode is None:
@@ -398,6 +403,7 @@ class GuardEngine:
         """Every frame, on the event loop: must stay well under a millisecond or so.
         Evidence ring + stage-1 gate + latest-frame-wins hand-off."""
         self.frames += 1
+        self.metrics.frame("received")
         self.last_frame_ts = ts
         self.evidence.append((ts, frame))
         while self.evidence and ts - self.evidence[0][0] > self.cfg.evidence_s:
@@ -406,6 +412,7 @@ class GuardEngine:
             g = self.gate.update(frame, active=self._active(ts))
             if g.global_change:
                 self.global_rejects += 1
+                self.metrics.global_reject()
             if g.motion:
                 self.last_motion_ts = ts
         if self.presence is not None and self.presence.update(frame, ts) and self._gone_task is None:
@@ -415,6 +422,7 @@ class GuardEngine:
                 pass
         if self._slot is not None:
             self.dropped += 1            # the detector never got to the previous frame
+            self.metrics.frame("dropped")
         self._slot = (ts, frame)
         self._evt.set()
 
@@ -442,8 +450,10 @@ class GuardEngine:
 
     async def process(self, frame: np.ndarray, ts: float) -> list[GuardEvent]:
         """Stage 2 -> tracker -> rules -> dispatch for one (latest) frame."""
+        step_before = self.limiter.step
         msg = self.limiter.evaluate(ts)
         if msg:
+            self.metrics.limiter_change("down" if self.limiter.step < step_before else "up")
             log.warning(msg)
             if self.gate is not None:
                 self.gate.scale = self.limiter.gate_scale
@@ -452,12 +462,14 @@ class GuardEngine:
             return []
         if ts - self.last_detect_ts < 1.0 / self.limiter.fps:
             self.skipped += 1
+            self.metrics.frame("skipped")
             return []
         self.last_detect_ts = ts
         t0 = time.perf_counter()
         dets = await asyncio.to_thread(self.gdet.detect, frame, self.window)
         self.limiter.record(time.perf_counter() - t0, ts)
         self.detections_run += 1
+        self.metrics.yolo()
         zones = self.zones
         keep: list[Det] = []
         for d in dets:
@@ -506,9 +518,11 @@ class GuardEngine:
         now = self._clock()
         if self.controller.muted:
             self.suppressed += 1
+            self.metrics.suppressed("paused")
             log.info("guard %s %s suppressed (paused)", sev, ev.rule)
             return
         if now - self.last_sent.get(ev.rule, -1e9) < self.cfg.cooldown_s:
+            self.metrics.suppressed("cooldown")
             log.info("guard %s %s skipped (cooldown)", sev, ev.rule)
             return
         self.last_sent[ev.rule] = now
@@ -517,6 +531,8 @@ class GuardEngine:
                                ack=(sev == ALERT and not (self.cfg.followup_main and jpegs)))
         latency = self._clock() - ev.cond_ts
         self.latencies.append(latency)
+        self.metrics.alert(sev, ev.rule)
+        self.metrics.rule_latency(latency)
         log.info("guard alert %s %s spot=%r held=%.1fs latency=%.2fs frames=%d",
                  sev, ev.rule, self.spot.name, ev.seconds, latency, len(jpegs))
         if sev == ALERT:
@@ -626,6 +642,8 @@ class GuardEngine:
                     jpegs.append(buf.tobytes())
         await self.outbox.send(text, jpegs=jpegs or None, buttons=buttons)
         self.latencies.append(self._clock() - now)
+        self.metrics.alert(ALERT, "CAR_GONE")
+        self.metrics.rule_latency(self._clock() - now)
         self.active_alert = ActiveAlert(text, self._clock(), buttons=buttons, kind="gone", started=now)
         log.info("guard alert ALERT CAR_GONE spot=%r absent for %.0fs", self.spot.name, now - absent_since)
 

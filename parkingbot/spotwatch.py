@@ -31,6 +31,7 @@ import numpy as np
 
 from .capture import CaptureError
 from .config import Settings, Spot
+from .metrics import NULL
 from .modes import Mode, ModeController, StateStore
 from .spot_tracker import FREE, SpotTracker, TrackerEvent
 
@@ -104,8 +105,10 @@ class Outbox:
     """
 
     def __init__(self, notifier: Notifier, clock: Callable[[], float] = time.time,
-                 image_ttl: float = 300.0, msg_ttl: float = 1800.0, maxlen: int = 20):
+                 image_ttl: float = 300.0, msg_ttl: float = 1800.0, maxlen: int = 20,
+                 metrics=NULL):
         self._n = notifier
+        self.metrics = metrics
         self._clock = clock
         self.image_ttl = image_ttl
         self.msg_ttl = msg_ttl
@@ -148,6 +151,7 @@ class Outbox:
             return True
         except Exception as exc:  # noqa: BLE001
             log.warning("telegram send failed, queued for retry: %s", exc)
+            self.metrics.send_failure()
             self.queue.append(item)
             return False
 
@@ -184,8 +188,9 @@ class SpotWatch:
                  mem_available: Callable[[], float],
                  clock: Callable[[], float] = time.time,
                  reader: Callable[[int], Awaitable[list]] | None = None,
-                 cfg: WatchConfig | None = None, tz=None):
+                 cfg: WatchConfig | None = None, tz=None, metrics=NULL):
         self.settings = settings
+        self.metrics = metrics
         self.cfg = cfg or WatchConfig.from_settings(settings)
         self.controller = controller
         self.store = store
@@ -193,7 +198,7 @@ class SpotWatch:
         self.detector = detector
         self.verifier = verifier
         self.stability = stability
-        self.outbox = Outbox(notifier, clock)
+        self.outbox = Outbox(notifier, clock, metrics=metrics)
         self._mem_available = mem_available
         self._clock = clock
         self._reader = reader or self._read_channel
@@ -302,6 +307,7 @@ class SpotWatch:
 
         self.last_cycle = CycleInfo(ts=now, duration_ms=(time.perf_counter() - t0) * 1000,
                                     kind="full" if full else "confirm", channels=due)
+        self.metrics.cycle(self.last_cycle.duration_ms / 1000.0)
         log.info("spotwatch cycle kind=%s mode=%s channels=%s ms=%.0f spots=%s",
                  self.last_cycle.kind, self.controller.mode.value, due,
                  self.last_cycle.duration_ms,
@@ -359,6 +365,7 @@ class SpotWatch:
         h.failures += 1
         h.last_error = str(exc)[:200] if isinstance(exc, CaptureError) else type(exc).__name__
         log.warning("grab failed ch=%s (%d in a row): %s", ch, h.failures, h.last_error)
+        self.metrics.grab_failure(ch)
         if h.failures >= self.cfg.fail_threshold:
             steps = min(h.failures - self.cfg.fail_threshold + 1, 6)
             h.next_try = self._clock() + min(self.cfg.backoff_max, self.cfg.interval * 2 ** steps)
@@ -375,6 +382,7 @@ class SpotWatch:
         # overrides FREE -> OCCUPIED when the ROI is unchanged (night YOLO misses).
         if self.stability.check(r, tr.confirmed):
             occupied = True
+            self.metrics.gate("stable")
             log.info("stable_override: %r", r.spot.name)
 
         # Gate 2: tier-2 detector, only for a free reading that could change state.
@@ -383,10 +391,12 @@ class SpotWatch:
             if mem < self.cfg.min_available_mb:
                 log.info("ram_defer: %r MemAvailable %.0f MB < %.0f MB, skipping reading",
                          r.spot.name, mem, self.cfg.min_available_mb)
+                self.metrics.gate("ram_defer")
                 return   # inconclusive: neither free nor occupied
             t2 = await asyncio.to_thread(self.detector.check_spot_tier2, r.frame, r.spot)
             if t2 is not None and t2.occupied:
                 occupied = True
+                self.metrics.gate("tier2")
                 log.info("tier2_override: %r cov=%.2f", r.spot.name, t2.coverage)
                 # Hand the strong tier-2 verdict to the stability gate as its
                 # reference. Where plain YOLO never sees the car (ch3 at night) the
@@ -399,6 +409,7 @@ class SpotWatch:
         if not occupied and tr.confirmed != FREE and r.spot.cross is not None:
             if await self._cross_sees_car(r.spot, tr):
                 occupied = True
+                self.metrics.gate("cross")
 
         events = tr.observe(occupied, self._clock(), muted=self.controller.muted)
         self._save_tracker(tr)
@@ -494,6 +505,7 @@ class SpotWatch:
                 verdict = await self.verifier.verify_spot(r.frame, r.spot)
                 if verdict.ok and verdict.occupied:
                     log.info("vlm_veto: %r (conf %.2f: %s)", name, verdict.confidence, verdict.reason)
+                    self.metrics.gate("vlm")
                     tr.veto_free()
                     self._save_tracker(tr)
                     return
@@ -508,13 +520,16 @@ class SpotWatch:
             text = f"{'⚠️ (doğrulanamadı) ' if unverified else ''}🟢 {name} {when} BOŞ"
             jpeg = await self._snapshot(r) if self.cfg.send_snapshot else None
             await self.outbox.send(text, jpeg=jpeg)
+            self.metrics.spot_alert("free_alert")
             log.info("alert free_alert %r immediate=%s snapshot=%s", name, ev.immediate, bool(jpeg))
         elif ev.kind == "reminder":
             await self.outbox.send(
                 f"🟢 {name} hâlâ BOŞ (hatırlatma {ev.n}/{self.cfg.remind_max})", silent=True)
+            self.metrics.spot_alert("reminder")
             log.info("alert reminder %r %d", name, ev.n)
         elif ev.kind == "taken":
             await self.outbox.send(f"🔴 {name} tekrar DOLU", silent=True)
+            self.metrics.spot_alert("taken")
             log.info("alert taken %r", name)
 
     async def _snapshot(self, r) -> bytes | None:

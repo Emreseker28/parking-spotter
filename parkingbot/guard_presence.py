@@ -39,13 +39,16 @@ def similarity(ref: np.ndarray, cur: np.ndarray, pad: int = 4) -> float:
 
 class PresenceMonitor:
     def __init__(self, box: Box, check_s: float = 5.0, low_sim: float = 0.30,
-                 low_checks: int = 3, refresh_s: float = 60.0, high_sim: float = 0.60):
+                 low_checks: int = 3, refresh_s: float = 60.0, high_sim: float = 0.60,
+                 warmup_s: float = 4.0):
         self.box = box
         self.check_s = check_s
         self.low_sim = low_sim
         self.low_checks = low_checks
         self.refresh_s = refresh_s
         self.high_sim = high_sim
+        self.warmup_s = warmup_s       # an HEVC stream starts with garbage frames: don't seed from them
+        self._first_ts: float | None = None
         self.ref: np.ndarray | None = None
         self.sim: float | None = None
         self.low_since: float | None = None
@@ -62,6 +65,10 @@ class PresenceMonitor:
         """Call for every frame; it only does work every ``check_s``. Returns True the
         moment ``low_checks`` consecutive low-similarity checks have accumulated."""
         if self.ref is None:
+            if self._first_ts is None:
+                self._first_ts = ts
+            if ts - self._first_ts < self.warmup_s:
+                return False
             self.reseed(frame, ts)
             return False
         if ts - self._last_check < self.check_s:

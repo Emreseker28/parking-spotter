@@ -296,3 +296,31 @@ class TrackerQuietFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PresenceWarmupTest(unittest.TestCase):
+    """Found live: seeding the reference from the first HEVC frames (garbage) made a parked car
+    look 'gone' for ~15 s after every arming (similarity 0.00)."""
+
+    def test_garbage_start_frames_do_not_become_the_reference(self):
+        from parkingbot.guard_presence import PresenceMonitor
+        garbage = np.full((288, 352, 3), 128, np.uint8)                 # flat grey decoder start-up frame
+        m = PresenceMonitor(CAR, check_s=1.0, warmup_s=4.0)
+        t, suspect = 0.0, False
+        for _ in range(3):                                              # first 3 s: garbage
+            t += 1.0
+            suspect |= m.update(garbage, t)
+        self.assertIsNone(m.ref)                                        # still warming up
+        for _ in range(20):                                             # then the real, stable scene
+            t += 1.0
+            suspect |= m.update(scene(True), t)
+        self.assertFalse(suspect)
+        self.assertGreater(m.sim, 0.6)
+
+    def test_without_warmup_the_same_stream_would_have_raised_a_false_suspicion(self):
+        from parkingbot.guard_presence import PresenceMonitor
+        garbage = np.full((288, 352, 3), 128, np.uint8)
+        m = PresenceMonitor(CAR, check_s=1.0, warmup_s=0.0)
+        m.update(garbage, 1.0)                                          # seeded from garbage
+        raised = any(m.update(scene(True), 2.0 + i) for i in range(6))
+        self.assertTrue(raised)                                         # the old behaviour, now avoided

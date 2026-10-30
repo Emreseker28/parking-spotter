@@ -26,6 +26,9 @@ def main() -> int:
     from .bot import build_application
 
     app = build_application(settings)
+    from .metrics import start_server
+
+    start_server(app.bot_data["parking_bot"], settings)
     logging.getLogger(__name__).info("Starting bot (long polling)…")
     # drop_pending_updates avoids replaying a backlog after downtime.
     app.run_polling(drop_pending_updates=True, allowed_updates=None)

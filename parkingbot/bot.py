@@ -39,6 +39,7 @@ from .autoswitch import AutoSwitch, CB_PREFIX as AM_CB
 from .car_store import CarStore
 from .guard import GuardEngine
 from .matcher import Matcher
+from .metrics import BotMetrics
 from .modes import Mode, ModeController, ModeUnavailable, StateStore
 from .push_state import load_push_state, save_push_state
 from .spotwatch import SpotWatch
@@ -186,6 +187,7 @@ class ParkingBot:
         self.spotwatch: SpotWatch | None = None
         self.guard: GuardEngine | None = None
         self.auto: AutoSwitch | None = None
+        self.metrics = BotMetrics()      # counters are always on; the HTTP endpoint is optional
         self.controller: ModeController | None = None
         self._sw_job = None
 
@@ -198,13 +200,13 @@ class ParkingBot:
             self.settings, self.controller, store, self.capture, self.detector,
             self.verifier, self.stability,
             TelegramNotifier(tg_bot, self.settings.secrets.allowed_chat_id),
-            mem_available=self._mem_available_mb, tz=tz,
+            mem_available=self._mem_available_mb, tz=tz, metrics=self.metrics,
         )
         self._job_queue = job_queue
         self.guard = None
         if bool(self.settings.guard.get("enabled", False)):
             self.guard = GuardEngine(self.settings, self.controller, self.capture, self.detector,
-                                     self.spotwatch.outbox, tz=tz)
+                                     self.spotwatch.outbox, tz=tz, metrics=self.metrics)
             self.controller.guard_available = True
             self.guard.on_departure = self._on_departure
             self.auto = AutoSwitch(self.settings, self.controller, Matcher(CarStore(store.db), None),
@@ -564,6 +566,23 @@ class ParkingBot:
             await query.message.edit_text(f"{query.message.text}\n\n{msg}")
         except Exception:  # noqa: BLE001 - editing is cosmetic
             await query.message.reply_text(msg)
+
+    async def heartbeat_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Optional Uptime Kuma push monitor: GET the URL from HEARTBEAT_URL while the bot loop
+        is alive and has completed a recent Spot Watch cycle. Failures are only logged."""
+        url = os.environ.get("HEARTBEAT_URL", "").strip()
+        if not url or self.spotwatch is None:
+            return
+        age = time.time() - self.spotwatch.last_cycle.ts if self.spotwatch.last_cycle.ts else None
+        if age is None or age > 5 * self.spotwatch.cfg.interval:
+            return                      # stalled: stay silent so the monitor goes red
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(url, params={"status": "up", "msg": "OK"})
+        except Exception as exc:  # noqa: BLE001
+            log.debug("heartbeat failed: %s", type(exc).__name__)
 
     async def _on_departure(self, reason: str) -> None:
         """The owner's car left (they said so, or they were paused for ~90 s): leave GUARD,
@@ -979,6 +998,7 @@ def build_application(settings: Settings) -> Application:
         .build()
     )
     bot = ParkingBot(settings)
+    app.bot_data["parking_bot"] = bot       # lets __main__ attach the metrics endpoint
     app.post_shutdown = _make_shutdown(bot)
     tz = apply_timezone(settings)
     watch_on = bool(settings.spotwatch.get("enabled", False))
@@ -1006,6 +1026,9 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(bot.on_camera_button, pattern=f"^{CAM_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(bot.on_feedback_button, pattern=f"^{CB_PREFIX[:-1]}"))
 
+    if os.environ.get("HEARTBEAT_URL", "").strip():
+        app.job_queue.run_repeating(bot.heartbeat_job, interval=60, first=45)
+        log.info("Uptime Kuma heartbeat enabled (every 60 s)")
     if watch_on:
         # Spot Watch replaces the 10-minute push loop (two alerters would double up).
         bot._schedule_spotwatch(2.0)

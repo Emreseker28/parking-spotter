@@ -17,6 +17,7 @@ ap.add_argument("--seconds", type=int, default=90)
 ap.add_argument("--playback", default=None)
 ap.add_argument("--gate", default=None, help="motion|xvr|both (default from config; playback forces motion)")
 ap.add_argument("--no-followup", action="store_true")
+ap.add_argument("--metrics-port", type=int, default=0, help="also serve /metrics on this port (0.0.0.0)")
 a = ap.parse_args()
 
 logging.basicConfig(level=logging.INFO, format="    %(asctime)s %(name)s: %(message)s")
@@ -73,7 +74,17 @@ if a.playback:
             "-fps_mode", "passthrough", "-vf", f"scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
 
-eng = GuardEngine(s, ctl, cap, Detector(s), outbox, cfg=cfg, tz=tz, source_factory=src)
+from parkingbot.metrics import BotMetrics
+from types import SimpleNamespace
+metrics = BotMetrics()
+eng = GuardEngine(s, ctl, cap, Detector(s), outbox, cfg=cfg, tz=tz, source_factory=src, metrics=metrics)
+if a.metrics_port:
+    from prometheus_client import start_http_server
+    fake_bot = SimpleNamespace(controller=ctl, spotwatch=None, guard=eng, auto=None, settings=s,
+                               metrics=metrics, _mem_available_mb=lambda: 0.0)
+    metrics.attach(fake_bot)
+    start_http_server(a.metrics_port, addr="0.0.0.0", registry=metrics.registry)
+    print(f"metrics on 0.0.0.0:{a.metrics_port}", flush=True)
 
 def cg(name):
     try: return open(f"/sys/fs/cgroup/{name}").read().split()
