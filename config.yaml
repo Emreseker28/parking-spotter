@@ -7,7 +7,7 @@
 # Config-driven: add/remove a camera by editing this map (no code change).
 cameras:
   1: "Sokak"
-  2: "Giriş"
+  4: "Giriş"
   3: "Bahçe"
 
 rtsp:
@@ -147,3 +147,23 @@ detection_tier2:
   model_path: "models/yolov8s.onnx"
   conf_threshold: 0.15
   min_available_mb: 2500      # defer the free alert below this host MemAvailable
+
+# Spot Watch (SPOT_WATCH mode): alert as soon as a watched spot becomes free.
+# Both spots above are watched independently. Replaces the push loop when enabled.
+# No image/video is ever written to disk by this mode; the alert snapshot is
+# encoded in RAM and sent straight to Telegram (decision D1).
+spotwatch:
+  enabled: true
+  interval_seconds: 60          # base cadence (30-120)
+  confirm_delay_seconds: 10     # a free reading is re-checked this soon (debounce)
+  confirm_reads: 2              # consecutive free readings required
+  remind_every_minutes: 10      # reminders while still free ...
+  remind_max: 3                 # ... at most this many
+  send_snapshot: true           # D1: snapshot from RAM attached to the alert
+  snapshot_quality: 80
+  subtype: 0                    # mainstream: the ROI polygons are in main-stream pixels
+  fail_threshold: 3             # consecutive grab failures before "camera unreachable"
+  backoff_max_seconds: 480
+  state_db: "state/spotter.db"  # SQLite: mode, settings, tracker state (never images)
+  state_max_age_hours: 12       # restore tracker state on restart only if this fresh
+  timezone: "Europe/Istanbul"   # camera clock is UTC+3; also used for "night"

@@ -1137,3 +1137,27 @@ push_job()
 *This document was generated from a complete investigation of the Parking Spotter
 codebase. For the full research/handoff document, see `parking-bot-plan.md`.
 For the running decisions log, see `docs/DECISIONS.md`.*
+
+---
+
+## 19. Spot Watch & Guard modes (2026-10-30: Phase 0 probes done, Phase 1 SPOT_WATCH implemented)
+
+Two new runtime modes are planned: **SPOT_WATCH** (alert when a watched spot frees up, ~60 s cadence,
+both ch1 and ch3 spots) and **GUARD** (near-continuous watch for suspicious activity around the
+owner's parked car), with later auto-switching via a one-time car "enrollment". Hard rule: no
+image or video is ever written to disk by these modes (RAM and pipes only, read-only container).
+
+Phase 0 probe facts that matter for the existing design (details in `docs/PROBE_RESULTS.md`):
+substream is CIF 352x288 at <=7 fps (HEVC); XVR event push (`eventManager.cgi`) and playback RTSP
+both work; plain YOLOv8n misses the ch3 car at dusk/IR (tier-2 finds it); physical core pairs are
+CPUs 0,2 and 1,3. The owner's car is sometimes parked elsewhere on the street, so "no car in either
+spot" must mean SPOT_WATCH, not an alarm. Anchor plan and decisions: `docs/DECISIONS.md`.
+
+**Phase 1 (implemented, pending deploy):** `spot_tracker.py` (per-spot debounce/alert/reminder
+logic), `modes.py` (SQLite `state/spotter.db`, UNKNOWN/SPOT_WATCH/PAUSED/GUARD controller),
+`spotwatch.py` (60 s engine over both spots with the stability -> tier-2 -> VLM gates, camera
+failure handling, Telegram outbox, `/status`). Commands: `/watch /guard /auto /pause /resume
+/status` (`/guard`, `/auto` are stubs until Phases 2/3). With `spotwatch.enabled: true` the old
+10-minute push loop is superseded. The ffmpeg grab now uses a pipe (no temp files) so the
+container can run `read_only: true`, pinned with `cpuset: "0,2"`, 700 MB, no swap. Steady-state
+cost ~2.8 % of one core. See `docs/DECISIONS.md` (Phase 1 entry) for numbers and gaps.

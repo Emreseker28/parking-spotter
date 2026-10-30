@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
-from pathlib import Path
 from urllib.parse import quote
 
 from .config import Settings
@@ -143,59 +141,60 @@ class CaptureWorker:
         return (w, h)
 
     async def _grab_ffmpeg(self, channel: int, subtype: int) -> bytes:
-        """Grab one JPEG frame via ffmpeg (RTSP). Serialized globally."""
+        """Grab one JPEG frame via ffmpeg (RTSP). Serialized globally.
+
+        The JPEG goes to a pipe (stdout), never a file: the container runs with a
+        read-only rootfs and the Spot Watch / Guard modes must never put an image
+        on disk.
+        """
         rtsp = self._s.rtsp
         cap = self._s.capture
         timeout = float(rtsp.get("timeout_seconds", 30))
         transport = rtsp.get("transport", "tcp")
         q = str(cap.get("jpeg_quality", 2))
 
-        with tempfile.TemporaryDirectory(prefix="parkbot_") as tmp:
-            out = Path(tmp) / "frame.jpg"
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-rtsp_transport", transport,
-                # ffmpeg-level socket I/O timeout (microseconds) as a backstop.
-                # ffmpeg 6.x renamed the old -stimeout to -timeout for RTSP.
-                "-timeout", str(int(timeout * 1_000_000)),
-                "-i", self._rtsp_url(channel, subtype),
-                "-frames:v", "1",
-                "-update", "1",  # required by ffmpeg 6.1 image2 muxer (plan §3)
-                "-q:v", q,
-                str(out),
-            ]
-            log.info(
-                "ffmpeg grab ch=%s subtype=%s url=%s",
-                channel, subtype, self._redacted_url(channel, subtype),
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-loglevel", "error",
+            "-rtsp_transport", transport,
+            # ffmpeg-level socket I/O timeout (microseconds) as a backstop.
+            # ffmpeg 6.x renamed the old -stimeout to -timeout for RTSP.
+            "-timeout", str(int(timeout * 1_000_000)),
+            "-i", self._rtsp_url(channel, subtype),
+            "-frames:v", "1",
+            "-q:v", q,
+            "-f", "image2pipe",
+            "-c:v", "mjpeg",
+            "pipe:1",
+        ]
+        log.info(
+            "ffmpeg grab ch=%s subtype=%s url=%s",
+            channel, subtype, self._redacted_url(channel, subtype),
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            # +10s wall-clock guard around the ffmpeg-level timeout.
+            data, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout + 10
             )
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise CaptureError(
+                f"ffmpeg timed out grabbing channel {channel}"
+            ) from exc
+
+        if proc.returncode != 0 or not data:
+            tail = (stderr or b"").decode(errors="replace").strip().splitlines()
+            detail = tail[-1] if tail else "no stderr"
+            raise CaptureError(
+                f"ffmpeg failed for channel {channel} "
+                f"(rc={proc.returncode}): {detail}"
             )
-            try:
-                # +10s wall-clock guard around the ffmpeg-level timeout.
-                _, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout + 10
-                )
-            except asyncio.TimeoutError as exc:
-                proc.kill()
-                await proc.wait()
-                raise CaptureError(
-                    f"ffmpeg timed out grabbing channel {channel}"
-                ) from exc
-
-            if proc.returncode != 0 or not out.exists():
-                tail = (stderr or b"").decode(errors="replace").strip().splitlines()
-                detail = tail[-1] if tail else "no stderr"
-                raise CaptureError(
-                    f"ffmpeg failed for channel {channel} "
-                    f"(rc={proc.returncode}): {detail}"
-                )
-
-            data = out.read_bytes()
-            if not data:
-                raise CaptureError(f"ffmpeg produced an empty frame for ch {channel}")
-            log.info("grabbed ch=%s subtype=%s bytes=%d", channel, subtype, len(data))
-            return data
+        log.info("grabbed ch=%s subtype=%s bytes=%d", channel, subtype, len(data))
+        return data

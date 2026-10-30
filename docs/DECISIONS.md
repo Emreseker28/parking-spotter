@@ -324,3 +324,99 @@ being measured in the live week. Frames leave the LAN for the ROI crop on pendin
 free flips only (explicit opt-in).
 
 **Decision: keep** (watch the live false-free rate and the AI Gate budget).
+
+## 2026-10-30 — Spot Watch & Guard plan, Phase 0: recon and probes
+
+Second plan series (SPOT_WATCH / GUARD modes + auto-switching). Phase 0 changed nothing in
+the production bot; full numbers in `docs/PROBE_RESULTS.md`, probe scripts in `scripts/probes/`.
+
+**Findings that change the plan:**
+- Substream is **CIF-only, 352x288, ≤7 fps** (not 640x360 @ 5 fps). Decode ~5 % of a logical
+  CPU vs ~31 % for the main stream → GUARD reads the substream, grabs main-stream frames on demand.
+- XVR **event push works** and the XVR **records 24/7 with working playback RTSP**.
+- Plain YOLOv8n misses the ch3 car at dusk/IR; tier-2 (yolov8s crop) finds it. SPOT_WATCH must
+  reuse the existing stability + tier-2 (+ VLM) gates.
+- OpenVINO: no gain (+60 MB). int8: ~20 % faster but lost detections → stay fp32/plain ORT.
+  Shipped ONNX models are static 640; 320/416 crop models need export. 2 ORT threads on one
+  core give only ~10–15 % over 1.
+- Read-only container with pipe-only ffmpeg works; existing `CaptureWorker` (temp dir) is not
+  reusable for the new modes. No `tmpfs` /tmp.
+- cpuset: physical core pairs are CPUs 0,2 and 1,3 (CPU is an i3-4130). Swap is full on the host.
+
+**D6 (owner, 2026-10-30): both ch1 and ch3 count as "in front of the house", and the owner's car
+is sometimes parked elsewhere on the street.** Consequences: SPOT_WATCH watches both spots
+independently; GUARD arms only when the owner's car is in one of the two spots (per-spot
+channel/zone); no car in either spot ⇒ stay SPOT_WATCH and never send CAR_GONE for a car the
+cameras cannot see; auto-switch must say which spot; departure is tracked per spot.
+
+**Not done:** Jellyfin-contention latency (needs GUARD; Phase 2), real overnight duty cycle,
+night person detection, XVR event delay, ch1 replay. D1 still awaits owner confirmation.
+
+**Decision: Phase 0 complete pending owner review of D1 and the substream consequences.**
+
+## 2026-10-30 — Spot Watch & Guard plan, Phase 1: mode controller + SPOT_WATCH
+
+Implemented, tested and live-checked; **not yet deployed to the production container**
+(owner to approve the restart: `docker compose up -d --build`).
+
+**What was built**
+- `parkingbot/spot_tracker.py` — pure per-spot state machine: 2 consecutive free readings,
+  alert on the free transition (or "free right now" on entering SPOT_WATCH), reminders every
+  10 min x3, "taken again", muted tracking during a pause, persisted state.
+- `parkingbot/modes.py` — SQLite store (`state/spotter.db`: mode, auto flag, pause, per-spot
+  tracker state; never images) + `ModeController` (UNKNOWN until verified against the camera,
+  SPOT_WATCH, PAUSED; GUARD raises "not implemented" until Phase 2).
+- `parkingbot/spotwatch.py` — the engine. Both spots, every 60 s; a free reading is re-checked
+  ~10 s later on only the affected channel. Camera failures never count as free; 3 in a row
+  -> ONE aggregated "unreachable" message, then exponential backoff, "reachable again" later.
+  Telegram outage: in-memory outbox, retried each cycle, snapshot dropped after 5 min, message
+  after 30 min. `/status` shows mode, spot states, per-camera health/latency, CPU/RSS, free RAM.
+- Commands `/watch /guard /auto /pause 10m /resume /status` (`/guard` and `/auto` are stubs
+  until Phases 2/3). `spotwatch.enabled: true` supersedes the 10-min push loop (two alerters
+  would double up); the old code stays behind `spotwatch.enabled: false`.
+- `capture.py`: the ffmpeg grab now writes to a pipe (`-f image2pipe ... pipe:1`), not a temp
+  file — required for `read_only: true` and the no-disk rule.
+- Compose: `read_only: true`, `cpuset: "0,2"` (one physical core), `mem_limit`/`memswap_limit`
+  700m (no swap), no `cpus:` quota, new `/app/state` volume (SQLite only), no tmpfs `/tmp`.
+  Dockerfile: `PYTHONDONTWRITEBYTECODE=1`, `TZ=Europe/Istanbul`.
+- Timezone (owner): Istanbul. `apply_timezone()` pins the process (so the existing night-hour
+  logic and the feedback "hour" now follow the camera clock instead of container UTC).
+
+**Design decisions**
+- SPOT_WATCH reads the **main stream** through the existing capture path, not the substream:
+  the ROI polygons are in main-stream pixels and Phase 0 showed 352x288 detection is unreliable.
+- Every "free" reading passes the existing gates before the tracker sees it: stability gate ->
+  tier-2 (yolov8s crop, behind the RAM guard) -> (after 2 reads) the VLM gate on the first
+  alert. A gate can only suppress an alert, never create one.
+- **Live finding fixed:** on ch3 plain YOLOv8n reads FREE every cycle (the car is there), so
+  tier-2 rescued it every minute (2.7 CPU-s/cycle, ~4.5 % of a core) because the stability gate
+  never got a reference (it only learns from plain-YOLO occupied readings). The engine now hands
+  tier-2's strong occupied result to the stability gate; steady state dropped to 1.7 CPU-s/cycle
+  (~2.8 % of a core), stability sims 0.78-0.85 vs threshold 0.45.
+- D1 confirmed by owner: alert snapshots are JPEG-encoded in RAM and sent straight to Telegram.
+  Spot Watch alerts do NOT carry the feedback buttons (they need a saved crop = an image on disk).
+
+**Measured (live, real XVR, read-only container pinned to CPUs 0,2, 700 MB, no swap)**
+- Steady state: 1.6-1.7 CPU-s per 60 s cycle (~2.8 %), 3.4 % average incl. startup and model
+  load. RSS ~190-220 MB, cgroup peak 200 MB, swap 0, `nr_throttled = 0`. Cycle wall time ~3.1 s.
+- Forced-free on real frames, gates ON: no alert (tier-2 / stability overruled it).
+- Forced-free, gates OFF: alert after the confirm re-check with an 87 KB snapshot decoding to
+  1080x960, built in RAM.
+- XVR unreachable: ONE message naming both cameras, no "free", mode stays UNKNOWN, backoff
+  30 -> 60 -> 90 s.
+- Latency worst case: freed right after a cycle -> 60 s + 10 s confirm + ~3 s processing = ~73 s
+  (inside the ~75 s target but with little slack).
+
+**Verification:** `python -m unittest discover -s tests` -> 133/133 (61 new: tracker, modes,
+engine with fakes incl. latency/passing car/unplugged camera/pause/restart/gates/outbox,
+pipe grab, command handlers + application wiring with mocked Telegram).
+
+**Known gaps / for the owner**
+- Not deployed; Telegram delivery itself was only tested with mocks (a second poller would
+  409 against production).
+- `/parking` still saves ROI crops to `data/frames` while `feedback.enabled: true` — that is an
+  existing feature, not Spot Watch, but it means "no image ever on disk" is not yet literally
+  true for the whole container. Say the word to turn it off for the new modes' sake.
+- Exit criterion "no new image files on the host during a run" holds for the Spot Watch runs
+  (read-only rootfs, tmpfs state); the 48 h soak and a real "spot freed" walk-through remain.
+- `UNKNOWN` startup with the camera down sends the unreachable message but nothing else.

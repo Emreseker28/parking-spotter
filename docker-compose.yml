@@ -24,13 +24,22 @@ services:
       # On the dedicated storage volume — NOT the root SSD, NOT the read-only
       # /mnt/models mount. Phase 0 task 1.
       - /mnt/storage/parking-spotter/data:/app/data
+      # SQLite state only (mode, settings, per-spot tracker state) -- never images.
+      - /mnt/storage/parking-spotter/state:/app/state
 
-    # Modest box (i3-4170 / 8GB). Keep the bot from starving the host.
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 1g
+    # No-disk guarantee for Spot Watch / Guard: the container rootfs is read-only
+    # (frames live in RAM and ffmpeg pipes only). The only writable mounts are the
+    # /app/data and /app/state volumes above/below; the SQLite state never holds
+    # images. Deliberately NO tmpfs for /tmp.
+    read_only: true
+
+    # Modest box (i3-4130 / 8GB). Pin to ONE physical core (CPUs 0 and 2 are the
+    # two hyperthreads of core 0; see `lscpu -e`) so Jellyfin/Nextcloud keep the
+    # other. A cpuset instead of a CFS quota (`cpus:`) -- a hard quota throttles
+    # in short bursts, which is bad for a latency-sensitive detector.
+    cpuset: "0,2"
+    mem_limit: 700m
+    memswap_limit: 700m      # equal to mem_limit => no swap
 
     logging:
       driver: json-file

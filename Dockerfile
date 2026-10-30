@@ -22,6 +22,8 @@ COPY config.yaml ./config.yaml
 
 # Cap CPU threads on the modest i3 (also set in config; this is a backstop).
 ENV OMP_NUM_THREADS=2 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Europe/Istanbul
 
 CMD ["python", "-m", "parkingbot"]

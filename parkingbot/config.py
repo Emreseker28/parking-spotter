@@ -80,6 +80,10 @@ class Settings:
         return self.raw.get("detection_tier2", {})
 
     @property
+    def spotwatch(self) -> dict:
+        return self.raw.get("spotwatch", {})
+
+    @property
     def inference(self) -> dict:
         return self.raw.get("inference", {})
 

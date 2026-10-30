@@ -9,6 +9,8 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
 
@@ -33,7 +35,9 @@ from .feedback import (
     save_spot_crop,
 )
 from .jsonl import append_jsonl
+from .modes import Mode, ModeController, ModeUnavailable, StateStore
 from .push_state import load_push_state, save_push_state
+from .spotwatch import SpotWatch
 from .stability import StabilityGate
 from .verifier import VerifyResult, Verifier
 
@@ -59,6 +63,55 @@ def restricted(func):
         return await func(self, update, context)
 
     return wrapper
+
+
+class TelegramNotifier:
+    """Sends Spot Watch messages to the owner's chat. Photos go straight from RAM
+    bytes; nothing is staged on disk."""
+
+    def __init__(self, bot, chat_id: int):
+        self._bot = bot
+        self._chat_id = chat_id
+
+    async def send_text(self, text: str, silent: bool = False) -> None:
+        await self._bot.send_message(chat_id=self._chat_id, text=text,
+                                     disable_notification=silent)
+
+    async def send_photo(self, jpeg: bytes, caption: str) -> None:
+        await self._bot.send_photo(chat_id=self._chat_id, photo=jpeg, caption=caption)
+
+
+_DUR_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$", re.IGNORECASE)
+
+
+def parse_duration(text: str, default: float = 600.0) -> float | None:
+    """'10m' / '90s' / '1h' / '15' (minutes) -> seconds; '' -> default; bad -> None."""
+    if not text.strip():
+        return default
+    m = _DUR_RE.match(text)
+    if not m:
+        return None
+    n, unit = float(m.group(1)), m.group(2).lower() or "m"
+    secs = n * {"s": 1, "m": 60, "h": 3600}[unit]
+    return secs if 0 < secs <= 24 * 3600 else None
+
+
+def apply_timezone(settings: Settings):
+    """Pin the process to the configured zone (Istanbul) so every localtime user
+    (night hours, feedback hour) agrees with the camera clock, not container UTC.
+    Returns the ZoneInfo (or None if unavailable)."""
+    name = str(settings.spotwatch.get("timezone", "Europe/Istanbul"))
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(name)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("timezone %r unavailable (%s); leaving process TZ unchanged", name, exc)
+        return None
+    os.environ["TZ"] = name
+    if hasattr(time, "tzset"):
+        time.tzset()
+    return tz
 
 
 class ParkingBot:
@@ -102,6 +155,26 @@ class ParkingBot:
         raw_log = str(settings.verify.get("log_path", "data/parking-accuracy.jsonl"))
         p = Path(raw_log)
         self._audit_log = p if p.is_absolute() else (ROOT / p)
+
+        # Spot Watch (set up in init_spotwatch once the Telegram bot exists).
+        self.spotwatch: SpotWatch | None = None
+        self.controller: ModeController | None = None
+        self._sw_job = None
+
+    def init_spotwatch(self, tg_bot, job_queue, tz=None) -> None:
+        raw = Path(str(self.settings.spotwatch.get("state_db", "state/spotter.db")))
+        db = raw if raw.is_absolute() else (ROOT / raw)
+        store = StateStore(db)
+        self.controller = ModeController(store)
+        self.spotwatch = SpotWatch(
+            self.settings, self.controller, store, self.capture, self.detector,
+            self.verifier, self.stability,
+            TelegramNotifier(tg_bot, self.settings.secrets.allowed_chat_id),
+            mem_available=self._mem_available_mb, tz=tz,
+        )
+        self._job_queue = job_queue
+        log.info("Spot Watch enabled: every %.0fs, state db %s",
+                 self.spotwatch.cfg.interval, db)
 
     def _restore_push_state(self) -> dict[str, dict]:
         state = load_push_state(self._push_state_path, self._push_state_max_age)
@@ -223,7 +296,8 @@ class ParkingBot:
             "🚗 *Parking Spotter*\n\n"
             "/cameras — view a camera\n"
             "/parking — check the parking spots now\n"
-            "/accuracy — bot vs. AI credibility score",
+            "/accuracy — bot vs. AI credibility score\n"
+            "/watch /pause 10m /resume /status — Spot Watch",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -277,6 +351,95 @@ class ParkingBot:
                 [(r, i) for i, r in enumerate(results)], "parking"
             ),
         )
+
+    # ----------------------------------------------------- Spot Watch commands
+    def _schedule_spotwatch(self, when: float) -> None:
+        """Keep exactly one pending Spot Watch job: replace any scheduled one."""
+        if self._sw_job is not None:
+            self._sw_job.schedule_removal()
+        self._sw_job = self._job_queue.run_once(self.spotwatch_job, when=when)
+
+    async def spotwatch_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Run one cycle and ALWAYS reschedule (a crash must never end the loop)."""
+        delay = float(self.spotwatch.cfg.interval)
+        try:
+            delay = await self.spotwatch.run_cycle()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("spotwatch cycle crashed: %s", exc)
+        finally:
+            self._schedule_spotwatch(delay)
+
+    async def _sw_reply(self, update: Update, text: str) -> bool:
+        if self.spotwatch is None:
+            await update.effective_message.reply_text("Spot Watch kapalı (config: spotwatch.enabled).")
+            return False
+        await update.effective_message.reply_text(text)
+        return True
+
+    @restricted
+    async def cmd_watch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        self.controller.set_manual(Mode.SPOT_WATCH)
+        self.spotwatch.kick()
+        self._schedule_spotwatch(0.5)
+        await update.effective_message.reply_text(
+            "👀 SPOT_WATCH (manuel). Park yerleri izleniyor; boşalınca haber vereceğim.")
+
+    @restricted
+    async def cmd_guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        try:
+            self.controller.set_manual(Mode.GUARD)
+        except ModeUnavailable:
+            await update.effective_message.reply_text(
+                "🛡️ GUARD henüz yok (Faz 2'de geliyor). SPOT_WATCH devam ediyor.")
+
+    @restricted
+    async def cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        self.controller.set_auto(True)
+        await update.effective_message.reply_text(
+            "🔁 Otomatik mod işaretlendi, ancak otomatik geçiş (arabanı tanıma) "
+            "Faz 3'te geliyor; şimdilik SPOT_WATCH sabit.")
+
+    @restricted
+    async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        secs = parse_duration(" ".join(context.args or []))
+        if secs is None:
+            await update.effective_message.reply_text("Kullanım: /pause 10m  (s, m veya h; en çok 24h)")
+            return
+        try:
+            self.controller.pause(secs)
+        except ValueError as exc:
+            await update.effective_message.reply_text(f"Şu an duraklatılamaz: {exc}")
+            return
+        await update.effective_message.reply_text(
+            f"⏸️ {secs / 60:.0f} dk duraklatıldı (bildirimler kapalı, izleme sürüyor). /resume ile bitir.")
+
+    @restricted
+    async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        msg = "▶️ Devam ediyor." if self.controller.resume() else "Duraklatılmış bir şey yok."
+        self.spotwatch.kick()
+        await update.effective_message.reply_text(msg)
+
+    @restricted
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.spotwatch is None:
+            await self._sw_reply(update, "")
+            return
+        await update.effective_message.reply_text(self.spotwatch.status_text())
 
     @restricted
     async def cmd_accuracy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -592,6 +755,12 @@ BOT_COMMANDS = [
     ("cameras", "Kamerayı gör"),
     ("parking", "Park yerlerini kontrol et"),
     ("accuracy", "Bot doğruluk raporu"),
+    ("watch", "Park yeri izleme modu"),
+    ("guard", "Araba koruma modu (yakında)"),
+    ("auto", "Otomatik mod geçişi"),
+    ("pause", "Bildirimleri duraklat, örn. /pause 10m"),
+    ("resume", "Duraklatmayı bitir"),
+    ("status", "Mod ve sağlık durumu"),
 ]
 
 
@@ -609,16 +778,31 @@ def build_application(settings: Settings) -> Application:
         .build()
     )
     bot = ParkingBot(settings)
+    tz = apply_timezone(settings)
+    watch_on = bool(settings.spotwatch.get("enabled", False))
+    if watch_on:
+        bot.init_spotwatch(app.bot, app.job_queue, tz)
 
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("help", bot.cmd_start))
     app.add_handler(CommandHandler("cameras", bot.cmd_cameras))
     app.add_handler(CommandHandler("parking", bot.cmd_parking))
     app.add_handler(CommandHandler("accuracy", bot.cmd_accuracy))
+    app.add_handler(CommandHandler("watch", bot.cmd_watch))
+    app.add_handler(CommandHandler("guard", bot.cmd_guard))
+    app.add_handler(CommandHandler("auto", bot.cmd_auto))
+    app.add_handler(CommandHandler("pause", bot.cmd_pause))
+    app.add_handler(CommandHandler("resume", bot.cmd_resume))
+    app.add_handler(CommandHandler("status", bot.cmd_status))
     app.add_handler(CallbackQueryHandler(bot.on_camera_button, pattern=f"^{CAM_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(bot.on_feedback_button, pattern=f"^{CB_PREFIX[:-1]}"))
 
-    if settings.push.get("enabled", False):
+    if watch_on:
+        # Spot Watch replaces the 10-minute push loop (two alerters would double up).
+        bot._schedule_spotwatch(2.0)
+        if settings.push.get("enabled", False):
+            log.info("push loop disabled: superseded by spotwatch")
+    elif settings.push.get("enabled", False):
         interval = float(settings.push.get("interval_minutes", 10)) * 60
         # Self-rescheduling run_once chain: push_job reschedules itself after each
         # run with the adaptive interval (Phase 5).
